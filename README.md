@@ -197,7 +197,7 @@ viewer.bat                                                              # 起本
   .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --iters 600 --out runs/style_trial6 --arm-pose models/arm_pose.json --freq 0.75,1.1 --duty 0.5,0.7 --rw arm_dev=0,arm_swing=0.5,clock=1.0,head_level=5,foot_roll=2,foot_yaw=1.5,foot_slip=0,point_slip=3,waist_twist=2,pelvis_level=5,step_width=1,foot_clear=1,heel_down=2,toe_off=0.5,swing_flat=2
   .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --resume runs/style_trial6/ckpt.pt --iters 400 --out runs/style_trial7 （其余参数同上, 改 point_slip=5）
   ```
-  回归测验（`runs/style_trial7/regress.json`）：前进速度误差 0.07 m/s、转向误差 0.07 rad/s、步频误差 0.7 步/分、着地比例误差 0.13、骨盆侧倾 ±4.6°、扭转 ±3.6°（略小于真人）、两脚间距 10 cm、头 ±1.2°、蹬地 48°、落地脚尖朝上 24°、打滑 4.4 cm/s，测验和 20 秒随机换指令都没人摔。回放"阶段0底座 · 防打滑 · 1000轮"。中间几版的目录已移除，回放还在列表里。
+  回归测验（`runs/style_trial7/regress.json`）：前进速度误差 0.07 m/s、转向误差 0.07 rad/s、步频误差 0.7 步/分、着地比例误差 0.13、骨盆侧倾 ±4.6°、扭转 ±3.6°（略小于真人）、两脚间距 10 cm、头 ±1.2°、蹬地 48°、落地脚尖朝上 24°、打滑 4.4 cm/s，测验和 20 秒随机换指令都没人摔。回放"阶段0底座 · 防打滑 · 1000轮"。中间几版的目录已移除，回放移到了 `web/replays/archive/`（不在列表里，要看就把文件和 `archive/index_before_cleanup.json` 里对应的那条放回去）。
 
 ## 回放页面
 - 底部工具栏："特写"对准第一个人，"全景"回默认镜头，空格暂停。默认打开最近一次导出的回放，勾选多个可同台对比（每组一段跑道）。
