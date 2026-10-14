@@ -43,7 +43,7 @@ REWARD = dict(
     pelvis_level=0.0,  # 惩罚骨盆相对地面左右侧倾(走路像模特扭胯); 真人约 ±4~5°。例如 10.0
     step_width=0.0,    # 两脚左右间距(朝向坐标系)小于 STEP_WIDTH_MIN 时罚, 贴着中线或交叉时罚满 1。例如 1.0
     heel_down=0.0,     # 每次着地的前 70%(按步态时钟)脚跟要踩实: 罚脚尖朝下(踮脚); 最后 30% 留给蹬地, 落地时脚尖朝上不罚。例如 2.0
-    toe_off=0.0,       # 每次着地的最后 30% 脚跟抬起、脚尖压地(蹬地)给奖励, 压到 20° 封顶(正奖励, 每只脚最多 1)。例如 0.5
+    toe_off=0.0,       # 每次着地的最后 30% 脚还踩着地时脚跟抬起、脚尖压地(蹬地)给奖励, 压到 20° 封顶(每只脚最多 1)。例如 0.5
     swing_flat=0.0,    # 摆动中段(进度 25%~75%)脚要放平: 罚脚相对地面前后倾斜(朝上朝下都罚)。例如 2.0
     foot_clear=0.0,    # 步态时钟说该摆动的脚, 离地高度要跟上 FOOT_CLEAR_H * sin(pi * 摆动进度), 低了就罚。例如 1.0
 )
@@ -361,7 +361,7 @@ class HumanoidEnv:
             sin_down = -2 * (fx_ * fz_ - fw_ * fy_)        # 脚的前后轴朝下的分量 = sin(脚尖朝下的角度), 朝上为负
             swing_prog = (ph - D) / (1 - D).clamp(min=1e-3)
             r = r - rw["heel_down"] * ((ph < 0.7 * D) * sin_down.clamp(min=0) ** 2).sum(dim=1)
-            late = (ph >= 0.7 * D) & (ph < D)
+            late = (ph >= 0.7 * D) & (ph < D) & (self.contact > 0)    # 要真踩着地: 否则脚已经往前摆了还保持脚尖朝下拿奖励, 脚尖就拖地
             r = r + rw["toe_off"] * (late * (sin_down.clamp(min=0) / math.sin(math.radians(20))).clamp(max=1)).sum(dim=1)
             mid_swing = (ph >= D) & (swing_prog >= 0.25) & (swing_prog < 0.75)
             r = r - rw["swing_flat"] * (mid_swing * sin_down ** 2).sum(dim=1)
