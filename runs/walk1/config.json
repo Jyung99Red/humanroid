@@ -1,0 +1,24 @@
+{
+ "iters": 1500,
+ "envs": 4096,
+ "T": 24,
+ "epochs": 5,
+ "mb": 4,
+ "lr": 0.0005,
+ "critic_lr": 0.0005,
+ "ent": 0.005,
+ "init_std": 0.5,
+ "ep_len": 500,
+ "action_frac": 0.3,
+ "rw": "",
+ "out": "runs/walk1",
+ "resume": "",
+ "save_every": 10,
+ "snap_every": 50,
+ "seed": 0,
+ "env": {
+  "ep_len": 500,
+  "action_frac": 0.3,
+  "reward": {}
+ }
+}

@@ -1,0 +1,31 @@
+{
+ "iters": 400,
+ "envs": 4096,
+ "T": 24,
+ "epochs": 5,
+ "mb": 4,
+ "lr": 0.0005,
+ "critic_lr": 0.0005,
+ "ent": 0.005,
+ "init_std": 0.5,
+ "ep_len": 500,
+ "action_frac": 0.3,
+ "arm_pose": "models/arm_pose.json",
+ "rw": "arm_dev=0,arm_swing=0.5",
+ "swing_amp": 0.35,
+ "out": "runs/walk3",
+ "resume": "runs/walk2/ckpt.pt",
+ "save_every": 10,
+ "snap_every": 50,
+ "seed": 0,
+ "env": {
+  "ep_len": 500,
+  "action_frac": 0.3,
+  "reward": {
+   "arm_dev": 0.0,
+   "arm_swing": 0.5
+  },
+  "arm_pose": "models/arm_pose.json",
+  "arm_swing_amp": 0.35
+ }
+}

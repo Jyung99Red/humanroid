@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# 训练产物: 检查点和快照很大, 不进版本库; 每个 runs/xxx 里的 config.json、train_log.csv、regress.json 很小, 留着
+runs/**/*.pt
+runs/**/snaps/
+runs/**/stdout.log
+
+# 回放每个约 2.5 MB, 随时可以用 export.py 重新导出
+web/replays/
