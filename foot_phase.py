@@ -17,7 +17,7 @@ from policy import load_policy
 @torch.no_grad()
 def measure(path, n=64, T=600, f=0.9, D=0.6, vx=1.0):
     env, act, meta = load_policy(path, n, seed=3, random_yaw=False, cmd_vx=(vx, vx), cmd_vy=(0.0, 0.0), cmd_wz=(0.0, 0.0),
-                                 cmd_freq=(f, f), cmd_duty=(D, D))
+                                 cmd_freq=(f, f), cmd_duty=(D, D), cmd_stand=0.0)
     env.ep_len = env.cmd_period = 10 ** 9
     idx = torch.arange(n, device=env.dev)
     env.t[:] = 0

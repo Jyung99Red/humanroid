@@ -31,11 +31,12 @@ p.add_argument("--arm-pose", type=str, default="", help="手臂默认姿势 json
 p.add_argument("--rw", type=str, default="", help="覆盖奖励权重, 例如 clock=0.5,alive=0.1")
 p.add_argument("--swing-amp", type=float, default=0.35, help="摆臂幅度: 指令 1 m/s 时上臂前后各摆多少弧度(配合 --rw arm_swing=...)")
 p.add_argument("--gait-period", type=float, default=0.8, help="步态周期(秒, 左右脚各迈一步): 越大步频越慢, 同样速度下步子越大; 给了 --freq 就不用它")
-p.add_argument("--vx", default="0.4,1.2", help="指令范围 lo,hi: 前进速度 m/s")
+p.add_argument("--vx", default="0.4,1.2", help="指令范围 lo,hi: 前进速度 m/s; 负数开头要写成 --vx=-0.6,1.2")
 p.add_argument("--vy", default="0,0", help="指令范围: 侧移速度 m/s")
 p.add_argument("--wz", default="-0.3,0.3", help="指令范围: 转向速度 rad/s")
 p.add_argument("--freq", default="", help="指令范围: 步频(步态周期/秒, 步数/分 = 120 x 步频); 不给就固定为 1/gait-period")
 p.add_argument("--duty", default="0.5,0.5", help="指令范围: 着地比例(>0.5 走, <0.5 跑, 1 站)")
+p.add_argument("--stand", type=float, default=0.0, help="抽指令时站定(速度全 0、着地比例 1)的概率, 例如 0.15")
 p.add_argument("--out", type=str, default="runs/walk1")
 p.add_argument("--resume", type=str, default="")
 p.add_argument("--obs-add", type=str, default="", help="给演员加观测块(逗号分隔), 例如续训时加新输入; 可用块见 env.OBS_BLOCKS")
@@ -65,7 +66,7 @@ priv += [n for n in split(a.priv_add) if n not in obs + priv]
 rng = lambda s: tuple(float(v) for v in s.split(","))
 env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy), cmd_wz=rng(a.wz), cmd_duty=rng(a.duty),
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
-               gait_period=a.gait_period)
+               gait_period=a.gait_period, cmd_stand=a.stand)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
 ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym)

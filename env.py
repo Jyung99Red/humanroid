@@ -27,6 +27,8 @@ wp.config.quiet = True
 REWARD = dict(
     lin_vel=1.0,       # 跟踪前进/侧移速度指令
     ang_vel=0.5,       # 跟踪转向速度指令
+    lin_vel_fine=0.0,  # 窄的速度跟踪(误差尺度 TRACK_FINE): 宽的那项误差 0.15 m/s 只扣 9%, 动作种类一多策略就宁可跟不准。例如 1.0
+    ang_vel_fine=0.0,  # 窄的转向跟踪, 同上。例如 1.0
     alive=0.2,         # 活着就给一点
     clock=0.3,         # 脚的着地节奏和步态时钟对齐
     upright=1.0,       # 惩罚躯干倾斜
@@ -52,6 +54,8 @@ REWARD = dict(
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
 FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原点平放时离地 0.027)。真人摆到中途脚底只离地几厘米; 定成 10 cm 会逼出踮脚走
 LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
+TRACK_FINE = 0.05         # 窄跟踪项的误差尺度: exp(-误差^2 / 0.05), 即 sigma 约 0.22(宽的那两项是 0.25, sigma 0.5)
+WALK_V = 0.3              # m/s, 前进(倒退)指令到这个速度, 脚的姿态规则完全按往前走(倒退)算; 速度指令为 0 时按站定算
 
 
 def quat_to_gravity(q):
@@ -140,7 +144,7 @@ class HumanoidEnv:
     def __init__(self, nworld, xml="models/humanoid_pd.xml", decimation=4, ep_len=500, action_frac=0.3,
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
-                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5)):
+                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -150,6 +154,7 @@ class HumanoidEnv:
         self.cmd_rng = (cmd_vx, cmd_vy, cmd_wz)
         # 步态指令的范围; 没给步频就用固定的 1 / gait_period(旧配置只有 gait_period)
         self.gait_rng = (cmd_freq or (1.0 / gait_period, 1.0 / gait_period), cmd_duty)
+        self.stand_prob = cmd_stand                       # 抽指令时有这么大概率是"站定": 速度全 0、着地比例 1
         self.rw = dict(REWARD, **(reward or {}))
         torch.manual_seed(seed)
         wp.init()
@@ -278,6 +283,10 @@ class HumanoidEnv:
             self.cmd[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
         for j, (lo, hi) in enumerate(self.gait_rng):
             self.gait[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
+        if self.stand_prob > 0:
+            st = idx[torch.rand(k, device=self.dev) < self.stand_prob]
+            self.cmd[st] = 0.0
+            self.gait[st, 1] = 1.0
         self.cmd_t[idx] = 0
 
     # ---------------- 观测 ----------------
@@ -373,6 +382,9 @@ class HumanoidEnv:
         self.m_lin_err, self.m_vx = lin_err, vx_h          # 给训练日志看的监控量
         r = rw["lin_vel"] * torch.exp(-lin_err / 0.25)
         r = r + rw["ang_vel"] * torch.exp(-((wz - self.cmd[:, 2]) ** 2) / 0.25)
+        if rw["lin_vel_fine"] or rw["ang_vel_fine"]:       # 宽的项保证离得远时也有梯度, 窄的项管跟得准
+            r = r + rw["lin_vel_fine"] * torch.exp(-lin_err / TRACK_FINE)
+            r = r + rw["ang_vel_fine"] * torch.exp(-((wz - self.cmd[:, 2]) ** 2) / TRACK_FINE)
         r = r + rw["alive"]
         # 步态时钟: 右脚在 [0, D) 该踩地, 左脚晚半个周期; D = 0.5 就是左右严格轮换, D = 1 两脚都该踩地(站)
         want = (torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0 < self.gait[:, 1:2]).float()
@@ -384,8 +396,9 @@ class HumanoidEnv:
         if rw["arm_dev"]:
             r = r - rw["arm_dev"] * ((self.qpos[:, self.qadr[self.arm_idx]] - self.q_def[self.arm_idx]) ** 2).sum(dim=1)
         if rw["arm_swing"]:
-            # 前半周期右脚着地往后蹬, 右臂从最后摆到最前(左臂相反); 走得越快摆得越大, 指令为 0 时目标就是默认姿势
-            swing = -torch.cos(2 * math.pi * self.phase) * self.swing_amp * self.cmd[:, 0].clamp(0, 1.5)
+            # 前半周期右脚着地往后蹬, 右臂从最后摆到最前(左臂相反); 走得越快摆得越大, 指令为 0 时目标就是默认姿势。
+            # 倒退时速度为负, 摆动反过来: 倒退是往前走倒着放, 手臂仍和对侧的腿同步
+            swing = -torch.cos(2 * math.pi * self.phase) * self.swing_amp * self.cmd[:, 0].clamp(-1.5, 1.5)
             arm_err = self.qpos[:, self.qadr[self.arm_idx]] - self.q_def[self.arm_idx] - swing[:, None] * self.swing_dir
             self.m_arm_err = (arm_err ** 2).sum(dim=1)
             r = r + rw["arm_swing"] * torch.exp(-self.m_arm_err / 0.15)
@@ -405,22 +418,32 @@ class HumanoidEnv:
             lat = -s * d[:, 0] + c * d[:, 1]
             r = r - rw["step_width"] * ((STEP_WIDTH_MIN - lat).clamp(min=0) / STEP_WIDTH_MIN).clamp(max=1) ** 2
         if rw["heel_down"] or rw["toe_off"] or rw["swing_flat"] or rw["foot_flat"] or rw["heel_strike"]:
-            # 按步态时钟分段: 着地前 70% 脚跟踩实, 着地最后 30% 蹬地, 摆动中段脚放平
+            # 按步态时钟分段(s = 着地进度 0 -> 1)。往前走: 着地前 70% 脚跟踩实, 最后 30% 蹬地, 前 15~20% 脚跟着地、脚尖可以翘。
+            # 倒退是往前走倒着放: 前 30% 前脚掌先着地(脚尖朝下不罚), 最后 15~20% 脚跟最后离地(脚尖可以翘)。
+            # 站定: 整个着地期脚踩平, 不蹬地。三种按速度指令混合(fwd + bwd + still = 1); 往前 WALK_V 以上和以前完全一样。
+            # 摆动中段两种走法都要脚放平。
             ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
             D = self.gait[:, 1:2]
+            vx = self.cmd[:, :1]
+            fwd, bwd = (vx / WALK_V).clamp(0, 1), (-vx / WALK_V).clamp(0, 1)
+            still = 1 - fwd - bwd
             fw_, fx_, fy_, fz_ = self.xquat[:, self.foot_ids].unbind(dim=2)
             sin_down = -2 * (fx_ * fz_ - fw_ * fy_)        # 脚的前后轴朝下的分量 = sin(脚尖朝下的角度), 朝上为负
+            stance, on = ph < D, self.contact > 0
+            sp = ph / D                                     # 着地进度(只在 stance 时有意义)
             swing_prog = (ph - D) / (1 - D).clamp(min=1e-3)
-            r = r - rw["heel_down"] * ((ph < 0.7 * D) * sin_down.clamp(min=0) ** 2).sum(dim=1)
-            late = (ph >= 0.7 * D) & (ph < D) & (self.contact > 0)    # 要真踩着地: 否则脚已经往前摆了还保持脚尖朝下拿奖励, 脚尖就拖地
-            r = r + rw["toe_off"] * (late * (sin_down.clamp(min=0) / math.sin(math.radians(20))).clamp(max=1)).sum(dim=1)
+            flat_w = stance * (fwd * (sp < 0.7) + bwd * (sp >= 0.3) + still)     # 这段时间脚要踩平
+            r = r - rw["heel_down"] * (flat_w * sin_down.clamp(min=0) ** 2).sum(dim=1)
+            # 蹬地(倒退时是前脚掌着地)要真踩着地: 否则脚已经往前摆了还保持脚尖朝下拿奖励, 脚尖就拖地
+            push = stance * on * (fwd * (sp >= 0.7) + bwd * (sp < 0.3))
+            r = r + rw["toe_off"] * (push * (sin_down.clamp(min=0) / math.sin(math.radians(20))).clamp(max=1)).sum(dim=1)
             mid_swing = (ph >= D) & (swing_prog >= 0.25) & (swing_prog < 0.75)
             r = r - rw["swing_flat"] * (mid_swing * sin_down ** 2).sum(dim=1)
             # 只有 heel_down 时脚尖朝上不罚, 策略可以一只脚整个着地期用脚跟走、脚尖一直翘着(style_trial6/7 的右脚)
-            up_ok = (ph < 0.2 * D) * math.sin(math.radians(LAND_TOE_UP))
-            r = r - rw["foot_flat"] * ((ph < 0.7 * D) * (-sin_down - up_ok).clamp(min=0) ** 2).sum(dim=1)
-            early = (ph < 0.15 * D) & (self.contact > 0)
-            r = r + rw["heel_strike"] * (early * (-sin_down).clamp(min=0) / math.sin(math.radians(15))).clamp(max=1).sum(dim=1)
+            up_ok = (fwd * (sp < 0.2) + bwd * (sp >= 0.8)) * math.sin(math.radians(LAND_TOE_UP))
+            r = r - rw["foot_flat"] * (flat_w * (-sin_down - up_ok).clamp(min=0) ** 2).sum(dim=1)
+            heel = stance * on * (fwd * (sp < 0.15) + bwd * (sp >= 0.85))
+            r = r + rw["heel_strike"] * (heel * ((-sin_down).clamp(min=0) / math.sin(math.radians(15))).clamp(max=1)).sum(dim=1)
         if rw["foot_clear"]:                               # 摆动进度 0 -> 1 时目标高度 0 -> H -> 0; 只罚低于目标
             ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
             D = self.gait[:, 1:2]

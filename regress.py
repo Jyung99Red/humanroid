@@ -25,6 +25,9 @@ from policy import load_policy
 # 指标: 键 -> (说明, 类别, 容差, 真人范围)。类别 err = 越小越好; range = 离真人范围越近越好; info = 只显示
 METRICS = {
     "vx_err": ("前进速度误差(最大, m/s)", "err", 0.05, None),
+    "back_err": ("倒退速度误差(最大, m/s)", "err", 0.05, None),
+    "stand_move": ("站定时漂移 m/s", "err", 0.03, None),
+    "stand_steps": ("站定时踏步 步/分", "err", 3, None),
     "wz_err": ("转向误差(最大, rad/s)", "err", 0.05, None),
     "track_fall": ("测验 1、2 摔倒(人)", "err", 0, None),
     "freq_err": ("步频误差(最大, 步/分)", "err", 3, None),
@@ -46,33 +49,45 @@ def mid(r):
     return (r[0] + r[1]) / 2
 
 
+FWD_POINTS, BACK_POINTS = (0.4, 0.8, 1.2), (-0.3, -0.6)   # 速度测点(只取训练范围里的), 外加范围两端
+WALK_V = 0.8                                               # 转向、步态网格测验时的前进速度(不在训练范围里就取中点)
+
+
 def run_tracking(env, act):
-    """测验 1 和 2: 每个人形一个固定指令。返回 (指标, 明细行)。"""
+    """测验 1 和 2: 每个人形一个固定指令。返回 (指标, 明细行)。
+    测点固定(而不是取范围两端和中点), 这样放宽指令范围后, 前进、转向、步态这几项还能和旧基线逐项比。"""
     (vx_r, _, wz_r), (f_r, d_r) = env.cmd_rng, env.gait_rng
     g_mid = (mid(f_r), mid(d_r))
-    speed = [((v, 0.0, 0.0), g_mid) for v in sorted({vx_r[0], mid(vx_r), vx_r[1]})]
-    turn = [((mid(vx_r), 0.0, w), g_mid) for w in sorted({wz_r[0], wz_r[1]}) if w != 0]
-    gait = [((mid(vx_r), 0.0, 0.0), (f, d)) for f in sorted({f_r[0], mid(f_r), f_r[1]}) for d in sorted({d_r[0], mid(d_r), d_r[1]})]
-    combos = speed + turn + gait
+    inside = lambda v: vx_r[0] <= v <= vx_r[1]
+    walk = WALK_V if inside(WALK_V) else mid(vx_r)
+    pts = sorted({v for v in FWD_POINTS + BACK_POINTS if inside(v)} | {vx_r[0], vx_r[1]})
+    combos = [("vx" if v > 0 else "back", (v, 0.0, 0.0), g_mid) for v in pts if v != 0]
+    combos += [("wz", (walk, 0.0, w), g_mid) for w in sorted({wz_r[0], wz_r[1]}) if w != 0]
+    combos += [("gait", (walk, 0.0, 0.0), (f, d)) for f in sorted({f_r[0], mid(f_r), f_r[1]}) for d in sorted({d_r[0], mid(d_r), d_r[1]})]
+    if env.stand_prob > 0:
+        combos.append(("stand", (0.0, 0.0, 0.0), (mid(f_r), 1.0)))
     reps = env.n // len(combos)
-    cmd = torch.tensor([c for c, _ in combos for _ in range(reps)], device=env.dev, dtype=torch.float32)
-    gt = torch.tensor([g for _, g in combos for _ in range(reps)], device=env.dev, dtype=torch.float32)
+    cmd = torch.tensor([c for _, c, _ in combos for _ in range(reps)], device=env.dev, dtype=torch.float32)
+    gt = torch.tensor([g for _, _, g in combos for _ in range(reps)], device=env.dev, dtype=torch.float32)
     pad = env.n - len(cmd)
     cmd, gt = torch.cat([cmd, cmd[:1].expand(pad, 3)]), torch.cat([gt, gt[:1].expand(pad, 2)])
     r = measure(env, act, cmd, gt)
     rows, out = [], dict(vx_err=0.0, wz_err=0.0, freq_err=0.0, duty_err=0.0, track_fall=0)
-    for i, (c, g) in enumerate(combos):
+    for i, (kind, c, g) in enumerate(combos):
         s = slice(i * reps, (i + 1) * reps)
         ok = ~r["fell"][s]
         m = lambda k: r[k][s][ok].mean().item() if ok.any() else float("nan")
         out["track_fall"] += int((~ok).sum())
-        if i < len(speed):
-            out["vx_err"] = max(out["vx_err"], abs(m("vx") - c[0]))
-        elif i < len(speed) + len(turn):
+        if kind in ("vx", "back"):
+            key = "vx_err" if kind == "vx" else "back_err"
+            out[key] = max(out.get(key, 0.0), abs(m("vx") - c[0]))
+        elif kind == "wz":
             out["wz_err"] = max(out["wz_err"], abs(m("wz") - c[2]))
-        else:
+        elif kind == "gait":
             out["freq_err"] = max(out["freq_err"], abs(m("freq") - g[0]) * 120)
             out["duty_err"] = max(out["duty_err"], abs(m("duty") - g[1]))
+        else:                                              # 站定: 不该走, 也不该原地踏步
+            out["stand_move"], out["stand_steps"] = abs(m("vx")), m("freq") * 120
         rows.append(f"  指令 vx {c[0]:4.2f} wz {c[2]:+4.2f} 步频 {g[0] * 120:3.0f} 着地 {g[1]:.2f} | 实际 vx {m('vx'):4.2f} wz {m('wz'):+5.2f}"
                     f" 步频 {m('freq') * 120:3.0f} 着地 {m('duty'):.2f} | 摔 {int((~ok).sum())}/{reps}")
     return out, rows
@@ -149,6 +164,8 @@ if __name__ == "__main__":
     print(f"\n{'指标':32s} {'本次':>8s} {'基线':>8s}  判定")
     bad = 0
     for key, (label, kind, tol, rng) in METRICS.items():
+        if key not in res:                                 # 这个策略没练过的项(例如没开站定)
+            continue
         b = base.get(key)
         v = verdict(key, res[key], b)
         bad += v.startswith("退步")

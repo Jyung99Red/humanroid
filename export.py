@@ -2,6 +2,7 @@
 
     python export.py runs/walk1/policy.pt --out web/replays/walk1_final.json --label "第 N 轮"
     python export.py runs/walk1/snaps/it_00050.pt --label "第 50 轮" --worlds 6 --steps 400 --cmd 1.0,0,0
+    python export.py runs/xxx/policy.pt --steps 600 --seq "0:1.0,0,0; 4:0,0,0,0.9,1; 7:-0.4,0,0"     # 按时间换指令: 走 -> 站定 -> 倒退
 
 策略用确定性动作(均值), 不加探索噪声。每个世界只记录到第一次摔倒/超时为止。
 坐标是 MuJoCo 原样(Z 轴朝上, 四元数 wxyz), 转成 three.js 的朝向由网页负责。
@@ -26,10 +27,12 @@ p.add_argument("--cmd", default="1.0,0,0", help="速度指令 vx,vy,wz")
 p.add_argument("--gait", default="", help="步态指令 步频,着地比例; 不给就用训练时范围的中点")
 p.add_argument("--seed", type=int, default=1)
 p.add_argument("--hold-heading", type=float, default=1.5, help="保持朝向的增益, 0 = 关闭(策略自己走会慢慢拐弯)")
+p.add_argument("--seq", default="", help="按时间换指令, 分号隔开的 秒:vx,vy,wz[,步频,着地比例]; 给了就不看 --cmd/--gait。站定(速度全 0)时不做保持朝向")
 a = p.parse_args()
 
-vx, vy, wz = (float(v) for v in a.cmd.split(","))
-fix = dict(cmd_vx=(vx, vx), cmd_vy=(vy, vy), cmd_wz=(wz, wz))
+seq = sorted((float(k), [float(v) for v in x.split(",")]) for k, x in (e.split(":") for e in a.seq.split(";") if e.strip())) if a.seq else []
+vx, vy, wz = seq[0][1][:3] if seq else (float(v) for v in a.cmd.split(","))
+fix = dict(cmd_vx=(vx, vx), cmd_vy=(vy, vy), cmd_wz=(wz, wz), cmd_stand=0.0)        # 训练时开了 --stand 的策略, 回放时不要随机抽到站定
 if a.gait:
     f, duty = (float(v) for v in a.gait.split(","))
     fix.update(cmd_freq=(f, f), cmd_duty=(duty, duty))
@@ -41,6 +44,7 @@ env.t[:] = 0
 env.cmd_t[:] = 0
 env.reset_idx(torch.arange(a.worlds, device=env.dev))
 env._sample_cmd(torch.arange(a.worlds, device=env.dev))
+gait0 = env.gait[0].clone()
 
 K, T = a.worlds, a.steps
 q_hist = torch.zeros(T, K, env.qpos.shape[1], device=env.dev)
@@ -50,7 +54,12 @@ end = torch.full((K,), T, dtype=torch.long, device=env.dev)       # 每个世界
 fell = torch.zeros(K, dtype=torch.bool, device=env.dev)
 with torch.no_grad():
     for t in range(T):
-        if a.hold_heading > 0:      # 偏航角 -> 转向指令(限制在训练时见过的范围内), 然后让观测反映这个指令
+        if seq:
+            c = [x for k, x in seq if k <= t * env.dt + 1e-9][-1]
+            env.cmd[:] = torch.tensor(c[:3], device=env.dev)
+            env.gait[:] = torch.tensor(c[3:5], device=env.dev) if len(c) >= 5 else gait0
+            wz = c[2]
+        if a.hold_heading > 0 and env.cmd[0].abs().sum() > 0:      # 偏航角 -> 转向指令(限制在训练时见过的范围内), 然后让观测反映这个指令
             qq = env.qpos[:, 3:7]
             yaw = torch.atan2(2 * (qq[:, 0] * qq[:, 3] + qq[:, 1] * qq[:, 2]), 1 - 2 * (qq[:, 2] ** 2 + qq[:, 3] ** 2))
             env.cmd[:, 2] = (wz - a.hold_heading * yaw).clamp(-0.3, 0.3)
@@ -91,7 +100,7 @@ for k in range(K):
 label = a.label or f"第 {meta['iteration']} 轮"
 out = a.out or f"web/replays/it_{meta['iteration']:05d}.json"
 os.makedirs(os.path.dirname(out), exist_ok=True)
-json.dump(dict(meta=dict(label=label, iteration=meta["iteration"], dt=float(env.dt), cmd=[vx, vy, wz], gait=env.gait[0].tolist()),
+json.dump(dict(meta=dict(label=label, iteration=meta["iteration"], dt=float(env.dt), cmd=[vx, vy, wz], gait=env.gait[0].tolist(), seq=a.seq),
                bodies=bodies, geoms=geoms, worlds=worlds), open(out, "w"), separators=(",", ":"))
 
 # 更新回放列表(同名文件覆盖并移到最后)

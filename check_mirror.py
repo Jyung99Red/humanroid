@@ -12,7 +12,7 @@ import torch
 
 from policy import load_policy
 
-env, act, meta = load_policy(sys.argv[1], 2, random_yaw=False, cmd_vx=(1.0, 1.0), cmd_vy=(0.0, 0.0), cmd_wz=(0.15, 0.15))
+env, act, meta = load_policy(sys.argv[1], 2, random_yaw=False, cmd_vx=(1.0, 1.0), cmd_vy=(0.0, 0.0), cmd_wz=(0.15, 0.15), cmd_stand=0.0)
 env.ep_len = env.cmd_period = 10 ** 9
 idx = torch.arange(2, device=env.dev)
 env.t[:] = 0
