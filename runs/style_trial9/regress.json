@@ -1,0 +1,21 @@
+{
+ "policy": "runs/style_trial9/policy.pt",
+ "iteration": 1800,
+ "metrics": {
+  "vx_err": 0.1081795215606689,
+  "wz_err": 0.053771737217903126,
+  "freq_err": 1.0410947799682724,
+  "duty_err": 0.0780593872070312,
+  "track_fall": 0,
+  "pelvis_roll": 5.782823902506381,
+  "pelvis_yaw": 4.242386713847517,
+  "width_cm": 9.757854461669922,
+  "head_pitch": 1.4198192534875125,
+  "clear_cm": 10.27517318725586,
+  "land_toe_up": 13.665399551391602,
+  "push_off": 44.378116607666016,
+  "slip_cms": 4.384273495516644,
+  "foot_lr_diff": 28.94589614868164,
+  "random_fall": 0
+ }
+}

@@ -39,7 +39,8 @@ def amp(a):
 def gait_samples(worlds, names, dt):
     """worlds: [(xpos [T,nb,3], xquat [T,nb,4], contact [T,2] 或 None), ...]。返回各项的原始样本(合并所有人形), 前 2 秒不算。"""
     acc = {k: [] for k in ("step_len", "step_time", "clear", "width", "roll_st", "pitch_st", "yaw_st", "roll_all", "ank_roll", "ank_pitch",
-                           "land_roll", "land_pitch", "slip", "pel_roll", "pel_yaw", "pel_sway", "land_width", "head_pitch", "head_yaw")}
+                           "land_roll", "land_pitch", "slip", "pel_roll", "pel_yaw", "pel_sway", "land_width", "head_pitch", "head_yaw",
+                           "pitch_st_right", "pitch_st_left", "land_pitch_right", "land_pitch_left")}
     real = all(c is not None for _, _, c in worlds)
     for xp, xq, con in worlds:
         if len(xp) < 200:
@@ -66,6 +67,7 @@ def gait_samples(worlds, names, dt):
             lift, land = np.flatnonzero(st[:-1] & ~st[1:]), np.flatnonzero(~st[:-1] & st[1:]) + 1
             acc["clear"].append([p[a:b, 2].max() - 0.027 for a, b in zip(lift, land[np.searchsorted(land, lift[0]):] if len(lift) else []) if b > a][:50])
             acc["land_roll"].append(sgn * roll[land]); acc["land_pitch"].append(pitch[land])
+            acc["pitch_st_" + side].append(pitch[st]); acc["land_pitch_" + side].append(pitch[land])   # 左右分开: 两只脚平均会掩盖一边脚尖一直翘着
             # 打滑: 脚跟点、脚尖点谁贴地(离地 < 1 cm, 前后两帧都是)谁的水平速度; 绕脚尖转动不算(和 env 的 point_slip 一致)
             for local in FOOT_POINTS:
                 q = p + R @ np.array(local)
@@ -100,7 +102,12 @@ def gait_stats(worlds, names, dt):
                 width_cm=np.median(cat["land_width"]) * 100, pelvis_roll=amp(cat["pel_roll"]), pelvis_yaw=amp(cat["pel_yaw"]),
                 pelvis_sway_cm=amp(cat["pel_sway"]) * 100, head_pitch=amp(cat["head_pitch"]), stance_toe_down=np.mean(cat["pitch_st"]),
                 land_toe_up=-np.mean(cat["land_pitch"]), push_off=np.percentile(cat["pitch_st"], 98), stance_roll=amp(cat["roll_st"]),
-                toe_out=amp(cat["yaw_st"]), slip_cms=np.mean(cat["slip"]) * 100)
+                toe_out=amp(cat["yaw_st"]), slip_cms=np.mean(cat["slip"]) * 100, foot_lr_diff=lr_diff(cat))
+
+
+def lr_diff(cat):
+    """左右脚俯仰差(度): 着地时平均、落地瞬间, 取大的。"""
+    return max(abs(np.mean(cat[k + "_right"]) - np.mean(cat[k + "_left"])) for k in ("pitch_st", "land_pitch"))
 
 
 def report(path):
@@ -115,6 +122,8 @@ def report(path):
           f" | 抬脚高度 {np.mean(cat['clear']) * 100:.1f} cm | 两脚左右间距 {stat(cat['width'] * 100)} cm")
     print(f"  支撑时 脚外翻(+)/内翻(-) {stat(cat['roll_st'])}° | 脚尖朝上(-)/朝下(+) {stat(cat['pitch_st'])}° | 外八(+)/内八(-) {stat(cat['yaw_st'])}°")
     print(f"  落地瞬间 翻转 {stat(cat['land_roll'])}° 俯仰 {stat(cat['land_pitch'])}° | 整个周期翻转 {stat(cat['roll_all'])}°")
+    print(f"  左右分开 支撑时俯仰 右 {np.mean(cat['pitch_st_right']):+5.1f}° 左 {np.mean(cat['pitch_st_left']):+5.1f}° | 落地瞬间俯仰"
+          f" 右 {np.mean(cat['land_pitch_right']):+5.1f}° 左 {np.mean(cat['land_pitch_left']):+5.1f}° | 左右差 {lr_diff(cat):.1f}°(应 < 3)")
     print(f"  脚踝相对小腿 翻转 {stat(cat['ank_roll'])}° 俯仰 {stat(cat['ank_pitch'])}° | 着地点打滑(脚跟/脚尖贴地时) {np.mean(cat['slip']) * 100:.1f} cm/s")
     print(f"  骨盆 侧倾 ±{amp(cat['pel_roll']):.1f}°(真人 ±4~5) 扭转 ±{amp(cat['pel_yaw']):.1f}°(±4~6) 左右晃 ±{amp(cat['pel_sway']) * 100:.1f} cm(±2~3)"
           f" | 落地时两脚左右间距 {np.median(cat['land_width']) * 100:.0f} cm(8~12)")

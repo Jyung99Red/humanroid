@@ -15,11 +15,14 @@
 .venv\Scripts\python.exe export.py runs/walk1/policy.pt --worlds 6      # 导出回放到 web/replays/（--cmd vx,vy,wz  --gait 步频,着地比例）
 .venv\Scripts\python.exe eval_policy.py runs/xxx/policy.pt              # 测跟指令: 实际步频、着地比例、速度
 .venv\Scripts\python.exe regress.py runs/新/policy.pt --baseline runs/旧/regress.json --save   # 回归测验, 和基线比
+.venv\Scripts\python.exe foot_phase.py runs/xxx/policy.pt              # 按步态时钟分 10 段, 左右脚各自的俯仰(脚跟着地/踩平/蹬地对不对)
+.venv\Scripts\python.exe check_mirror.py runs/xxx/policy.pt             # 检查身体/观测/奖励左右对称、镜像映射写对; 顺带量策略多不对称
 viewer.bat                                                              # 起本地服务并打开回放页面
 ```
 - 训练日志：每轮一行，同时写 `runs/<名>/train_log.csv`。每 10 轮存 `ckpt.pt`（续训）和 `policy.pt`（回放），每 50 轮存快照到 `snaps/`。
 - 回放：`export.py` 可导出任何快照；网页里勾选多个即同台对比。链接参数 `?r=文件1,文件2&t=秒&pause=1` 直达某个时刻。
 - 奖励不改代码调：`--rw clock=0.5,alive=0.1`；可用项见 `env.py` 顶部 `REWARD`。
+- 左右镜像约束：`train.py --sym 4`（见"设计要点"）。新加观测块要在 `env.HumanoidEnv._mirror_block` 写它的镜像，否则开了 `--sym` 会报错。
 - 指令范围：`--vx 0.4,1.2 --vy 0,0 --wz -0.3,0.3 --freq 0.75,1.1 --duty 0.5,0.7`（每个人形每 5 秒在范围里重抽一次）。不给 `--freq` 就固定为 1 / `--gait-period`。
 - 不给 `--arm-pose` 就是官方默认姿势（手臂斜向前伸）。
 - 身体模型（`--xml`）、观测块布局和其他环境设置一起存进策略文件，`export.py` 回放时用同一套。不给 `--xml` 是官方身体。
@@ -52,7 +55,9 @@ viewer.bat                                                              # 起本
 | `make_model.py` | 把官方 `humanoid.xml` 的 motor 换成 PD 位置执行器，并按预设调整身体（`official` / `human50`） |
 | `check_body.py` | 身体体检：和真人比质量分布、每公斤力气、活动范围，拳击姿势能否摆出，起跳测验（CEM 搜开环起跳动作） |
 | `find_arm_pose.py` | 用 MuJoCo 运动学搜"手臂自然下垂"的肩/肘角度 |
-| `check_feet.py`、`check_swing.py` | 从导出的回放量步态：步长/步频、脚的翻转和朝向、打滑、抬脚高度、骨盆侧倾/扭转、两脚间距、头的稳定（带真人参考范围）；摆臂幅度和相位。回放里存了每帧真实脚接触，旧回放退回估算。改训练后用来确认没退步 |
+| `check_feet.py`、`check_swing.py` | 从导出的回放量步态：步长/步频、脚的翻转和朝向（左右脚分开量俯仰，两只脚平均会掩盖一边不对）、打滑、抬脚高度、骨盆侧倾/扭转、两脚间距、头的稳定（带真人参考范围）；摆臂幅度和相位。回放里存了每帧真实脚接触，旧回放退回估算。改训练后用来确认没退步 |
+| `foot_phase.py` | 直接跑策略，左右脚按各自的步态时钟分 10 段量俯仰，外加着地时脚跟、脚尖离地多高。看"脚跟着地 → 踩平 → 蹬地"每个相位对不对、左右对不对得上 |
+| `check_mirror.py` | 两个世界：一个正常走，另一个从它的镜像状态出发、执行它动作的镜像，比观测和奖励是否一直互为镜像。改了身体、观测块或奖励后，开 `--sym` 前先跑一次 |
 | `bench.py`、`smoke_env.py`、`diag_policy.py` | 吞吐测试、环境冒烟测试、策略诊断 |
 | `web/index.html` + `web/vendor/` | 回放页面和 three.js 0.186.1（MIT，许可证在 `vendor/LICENSE-three`） |
 | `serve.py`、`viewer.bat` | 本地只读静态服务（端口 8765）和一键打开 |
@@ -84,8 +89,15 @@ viewer.bat                                                              # 起本
   - `toe_off`：每次着地的最后 30%、脚还踩着地时，脚跟抬起、脚尖压地给奖励（压到 20° 封顶）。只有 `heel_down` 时离地前不蹬地，用大腿直接把脚提起来。不要求"踩着地"的话，策略会在腿已经往前摆时还保持脚尖朝下拿奖励，脚尖就拖着地。
   - `point_slip`：脚跟点、脚尖点谁贴地（离地 < 1 cm）谁就不许水平移动。旧的 `foot_slip` 看脚中心的速度，蹬地时脚绕脚尖转、中心本来就动，它分不清"转"和"滑"，策略为了躲它干脆让脚尖蹭着走。新配方用 `point_slip`，`foot_slip` 设 0。
   - `swing_flat`：摆动中段（进度 25%～75%）罚脚相对地面前后倾斜。不加时摆腿把脚尖勾到 −31°。刚离地（脚尖朝下）和快落地（脚尖朝上准备脚跟着地）不管。
+  - `foot_flat`：着地时罚脚尖翘着。`heel_down` 只罚脚尖朝下，所以策略可以让一只脚整个着地期都用脚跟走、脚尖一直翘着（style_trial6/7 的右脚，脚尖翘 25～45°）。前 20% 是脚跟着地，脚尖最多翘 20°（`LAND_TOE_UP`）；20%～70% 脚要踩平。和 `heel_down` 合起来就是"脚跟着地 → 踩平 → 蹬地"。
+  - `heel_strike`：每次着地的前 15%、脚踩着地时，脚尖翘起给奖励（翘到 15° 封顶），和 `toe_off` 对称。实测对没有脚跟着地的那只脚不起作用：它落地时脚尖略朝下，奖励是 0、没有梯度。
   - 这些按步态时钟分段的项，本质上是在给走路写"关键帧"：规定每个相位该满足什么，不规定具体角度。阶段 1 打算换成动捕数据当风格老师（AMP），不用再一条条手写。
   - 为什么 walk4（D 版）不用这两项也走得像样：它训练时"着地"用"脚踝离地 < 5.5 cm"估算，踮脚或擦地走都会让脚踝越过 5.5 cm 而被当成"没着地"，节奏奖励扣分，等于间接逼着脚跟踩实、摆动时抬脚。改用真实接触后这两条隐含约束没了，要显式补上。
+- **左右镜像约束**（`--sym`，2026-10-14 加）：身体、观测、奖励都左右对称时，最优策略本该对称，但网络不会自己保证，两条腿可能各学一套（style_trial6/7：右脚脚跟走、左脚前脚掌）。做法：
+  - 镜像 = 关于躯干前后-竖直平面的反射。每个关节对应另一侧同名关节（躯干、脖子对应自己），变不变号由转轴算（转轴是赝矢量，镜像后 a → −Ma），站直时检查转轴和转动中心确实镜像（`env.mirror_joints`）。`human50` 四肢都不变号，`abdomen_z`、`abdomen_x`、`neck_z` 变号。
+  - 观测块的镜像（`_mirror_block`）：重力、线速度的 y 变号；角速度是赝矢量，x、z 变号；速度指令的侧移、转向变号；步态时钟差半个周期（左脚就是晚半个周期的右脚），sin、cos 都变号；两脚着地互换。全部是"带符号的排列"。
+  - 损失：演员加 `sym × |策略(镜像观测) − 镜像(策略(观测))|²`（各维求和）；评论家把镜像观测也学成同一个回报；探索噪声左右取平均。先镜像原始观测再归一化（归一化统计每维不同）。
+  - `check_mirror.py` 验证（style_trial10 策略驱动 100 步）：观测差约 1e−5、奖励差约 2e−5，即身体、观测、18 项奖励都严格对称。style_trial10 自己的不对称是平均 0.47（动作单位）。
 - **超时 ≠ 摔倒**：超时用终止前状态的价值做 bootstrap，摔倒才当终止。开局把各环境的回合进度打散，避免同时重置。
 - **学习率每轮调一次**：按最后一个 epoch 的平均 KL 调。逐小批调会塌缩（KL 相对收集时的旧策略累积，越往后越大，学习率只降不升）。
 - **价值网络 PopArt 式归一化**：改统计量时同步缩放输出层，价值输出不跳变。
@@ -192,12 +204,49 @@ viewer.bat                                                              # 起本
 
   离地时脚尖蹭地减了一半多，还没到 walk4 的水平；刚落地脚跟偶尔溜一下。同样的改动从头练 600 轮反而没练成（约束多了学得慢，有一组步态指令没走起来，回归测验报 5 项退步），所以用续训。
 
-- **阶段 0 底座 = `runs/style_trial7`**：先从头 600 轮（`point_slip=3`，当时 `toe_off` 还不要求踩着地），再续训 400 轮：
+- **左右脚不对称**（用户在回放里看出"右脚脚尖一直向上"）：style_trial6 从头练到第 150 轮就养成了右脚用脚跟走、左脚偏前脚掌的习惯，一直带到 style_trial7。`check_feet` 和回归测验以前把两只脚平均（−25° 和 +16° 平均下来约 −5°，看着正常），现在左右分开报，回归测验加了"左右脚俯仰差"。按右脚/左脚各自的步态时钟，着地时脚的俯仰（正 = 脚尖朝下；着地 0～0.6）：
+
+  | | 时钟 0.0 | 0.1 | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 着地时脚尖离地 > 2 cm |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | style_trial7 右 | −46 | −44 | −37 | −31 | −19 | +9 | +17 | +3 | −4 | −24 | 82% |
+  | style_trial7 左 | +2 | +5 | +7 | +13 | +25 | +43 | +41 | +7 | −3 | −6 | 0% |
+  | **style_trial10 右** | −24 | −8 | −4 | −4 | 0 | +21 | +28 | +5 | −3 | −21 | 24% |
+  | style_trial10 左 | +3 | +4 | +7 | +13 | +26 | +43 | +36 | +8 | 0 | −1 | 0% |
+
+  续训加 `foot_flat`：权重 2 练 400 轮右脚只从 −26° 动到 −20°（已经收敛，探索噪声 0.12、学习率 6e-5）；权重 6 再练 400 轮就踩平了。右脚现在是"脚跟着地（−24°，真人约 −20°）→ 踩平 → 蹬地"。剩下左脚：落地时脚尖略朝下（+3°），没有脚跟着地，前半段脚跟离地约 2 cm，左右差还有 25°（应 < 3）。`heel_strike` 对它无效（见上）。要根治左右不一样，加了镜像对称约束（见"设计要点"），从头重训（见下面"对称重训"）。
+
+- **阶段 0 底座 = `runs/sym2`**（2026-10-15 起，对称重训）：先从头 1000 轮（`runs/sym1`），配方 = style_trial6 的从头配方（`point_slip=3`）+ `foot_flat=6,heel_strike=0.5` + `--sym 4`；再续训 400 轮（`runs/sym2`），`heel_down` 2 → 6（脚跟抬得太早）、`point_slip` 3 → 5（同 style_trial6 → 7）：
+  ```
+  .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --iters 1000 --out runs/sym1 --arm-pose models/arm_pose.json --freq 0.75,1.1 --duty 0.5,0.7 --rw arm_dev=0,arm_swing=0.5,clock=1.0,head_level=5,foot_roll=2,foot_yaw=1.5,foot_slip=0,point_slip=3,waist_twist=2,pelvis_level=5,step_width=1,foot_clear=1,heel_down=2,toe_off=0.5,swing_flat=2,foot_flat=6,heel_strike=0.5 --sym 4
+  .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --resume runs/sym1/ckpt.pt --iters 400 --out runs/sym2 （其余同上, 改 point_slip=5,heel_down=6）
+  ```
+  - 学得比 style_trial6 快：第 200 轮回合长 219（style_trial6 是 83），第 300 轮 493，第 500 轮每步奖励 3.07（style_trial6 第 600 轮 3.00）。每轮约 1.0 秒（镜像损失多一次前向，原来 0.75 秒）。训练日志的"不对称"一列是镜像损失，0.002 左右。
+  - `foot_phase.py` 量的脚俯仰（正 = 脚尖朝下，各按自己的时钟，着地 0～0.6；指令 1 m/s、108 步/分、着地比例 0.6）：
+
+    | 时钟 | 0.0 | 0.1 | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 |
+    |---|---|---|---|---|---|---|---|---|---|---|
+    | sym1 右 / 左 | −19 / −19 | −5 / −4 | +7 / +7 | +17 / +17 | +28 / +28 | +41 / +40 | +33 / +33 | +6 / +6 | −7 / −6 | −23 / −22 |
+    | **sym2** 右 / 左 | −19 / −18 | −7 / −7 | +2 / +2 | +9 / +10 | +20 / +20 | +35 / +34 | +31 / +31 | +6 / +6 | −3 / −3 | −20 / −19 |
+    | style_trial10 右 / 左 | −24 / +3 | −8 / +4 | −4 / +7 | −4 / +13 | 0 / +26 | +21 / +43 | +28 / +36 | +5 / +8 | −3 / 0 | −21 / −1 |
+
+    两只脚一样，都是脚跟着地（−19°，真人约 −20°）。sym1 脚跟抬得早（0.2 就 +7°），`heel_down` 加到 6 后 0.2 踩平、0.3 起抬脚跟（真人约在周期 30% 抬），还略早一点。
+  - 回归测验（`runs/sym2/regress.json`，和 style_trial10 比没有退步）：前进速度误差 0.09 m/s、转向误差 0.04 rad/s、步频误差 0.6 步/分、着地比例误差 0.04、骨盆侧倾 ±6.0°（略大于真人 4～5）、扭转 ±4.9°、两脚间距 10 cm、头 ±1.3°、落地脚尖朝上 22°、蹬地 39°、**左右脚俯仰差 0.2°**（style_trial10 是 26°）、打滑 4.6 cm/s，测验和 20 秒随机换指令都没人摔。`check_mirror.py`：策略的不对称从 0.47 降到 0.005。
+  - 回放"阶段0底座 · 左右对称 · 1400轮"（`h50_sym.json`）。用户看过回放（"还可以"），换成底座。
+
+- **上一版底座 `runs/style_trial10`**（2026-10-14 用了一天，左脚没有脚跟着地；再之前是 `runs/style_trial7`，右脚脚尖一直翘着）：从 style_trial7 续训 3 段，每段 400 轮，参数同 style_trial7，只加：
+  ```
+  style_trial8:  --resume runs/style_trial7/ckpt.pt  ... foot_flat=2
+  style_trial9:  --resume runs/style_trial8/ckpt.pt  ... foot_flat=6
+  style_trial10: --resume runs/style_trial9/ckpt.pt  ... foot_flat=6,heel_strike=0.5
+  ```
+  回归测验（`runs/style_trial10/regress.json`，和 style_trial7 比没有退步）：前进速度误差 0.07 m/s、转向误差 0.04 rad/s、步频误差 1.0 步/分、着地比例误差 0.07、骨盆侧倾 ±5.0°、扭转 ±3.6°、两脚间距 11 cm、头 ±1.1°、蹬地 42°、落地脚尖朝上 12°（两只脚平均）、左右脚俯仰差 26°、打滑 4.0 cm/s，测验没人摔，20 秒随机换指令 1024 个摔 1 个。回放"阶段0底座 · 右脚踩平 · 2200轮"（`h50_flat.json`，已移到 `web/replays/archive/`）。
+
+- **更早的底座 `runs/style_trial7`**：先从头 600 轮（`point_slip=3`，当时 `toe_off` 还不要求踩着地），再续训 400 轮：
   ```
   .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --iters 600 --out runs/style_trial6 --arm-pose models/arm_pose.json --freq 0.75,1.1 --duty 0.5,0.7 --rw arm_dev=0,arm_swing=0.5,clock=1.0,head_level=5,foot_roll=2,foot_yaw=1.5,foot_slip=0,point_slip=3,waist_twist=2,pelvis_level=5,step_width=1,foot_clear=1,heel_down=2,toe_off=0.5,swing_flat=2
   .venv\Scripts\python.exe train.py --xml models/human50_pd.xml --resume runs/style_trial6/ckpt.pt --iters 400 --out runs/style_trial7 （其余参数同上, 改 point_slip=5）
   ```
-  回归测验（`runs/style_trial7/regress.json`）：前进速度误差 0.07 m/s、转向误差 0.07 rad/s、步频误差 0.7 步/分、着地比例误差 0.13、骨盆侧倾 ±4.6°、扭转 ±3.6°（略小于真人）、两脚间距 10 cm、头 ±1.2°、蹬地 48°、落地脚尖朝上 24°、打滑 4.4 cm/s，测验和 20 秒随机换指令都没人摔。回放"阶段0底座 · 防打滑 · 1000轮"。中间几版的目录已移除，回放移到了 `web/replays/archive/`（不在列表里，要看就把文件和 `archive/index_before_cleanup.json` 里对应的那条放回去）。
+  回归测验（`runs/style_trial7/regress.json`）：前进速度误差 0.07 m/s、转向误差 0.07 rad/s、步频误差 0.7 步/分、着地比例误差 0.13、骨盆侧倾 ±4.6°、扭转 ±3.6°（略小于真人）、两脚间距 10 cm、头 ±1.2°、蹬地 48°、落地脚尖朝上 24°、打滑 4.4 cm/s，测验和 20 秒随机换指令都没人摔。回放"阶段0底座 · 防打滑 · 1000轮"（`h50_base.json`，已移到 `web/replays/archive/`）。中间几版的目录已移除，回放移到了 `web/replays/archive/`（不在列表里，要看就把文件和 `archive/index_before_cleanup.json` 里对应的那条放回去）。
 
 ## 回放页面
 - 底部工具栏："特写"对准第一个人，"全景"回默认镜头，空格暂停。默认打开最近一次导出的回放，勾选多个可同台对比（每组一段跑道）。
@@ -234,7 +283,8 @@ viewer.bat                                                              # 起本
    - ✅ 策略输入可扩展：新输入的第一层权重零初始化，已有行为不变。
    - ✅ 站/走/跑统一成"速度 + 步频 + 着地比例"的指令（`gait` 观测块，`eval_policy.py` 测跟踪）。跟多准是奖励调参，放到阶段 1。
    - ✅ 一条命令的回归测验（`regress.py`）；✅ 版本管理（git，检查点和回放不进库）。
-   - 底座策略 `runs/style_trial7`（见"实测结果"）。
+   - ✅ 左右镜像约束（`--sym`，`check_mirror.py` 验证身体、观测、奖励严格对称）。
+   - 底座策略 `runs/sym2`（见"实测结果"）。
 1. **通才底层**：站定、倒退、侧移、快速转身、跑；随机推搡。用动捕数据当风格老师（AMP，例如 CMU 动捕库），替代手写的姿态奖励（2026-10-14 用户同意：先手写把走路调好，之后做 AMP）。
 2. **高层任务**（冻结底层，约 10 Hz 下指令）：到点 + 绕障碍 → 追移动目标 → 躲发球机的球（躲避球的"躲"）。
 3. **跳**：原地跳 → 跳上箱子 → 跨越障碍；地形（高度图观测 + 台阶/缺口，MuJoCo Warp 的 box 和 heightfield 都支持）。合起来是跑酷。

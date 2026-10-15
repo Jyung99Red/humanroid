@@ -36,6 +36,7 @@ METRICS = {
     "clear_cm": ("抬脚高度 cm", "info", 0, None),
     "land_toe_up": ("落地瞬间脚尖朝上 °(脚跟先着地)", "info", 0, None),
     "push_off": ("支撑末段脚尖朝下 °(蹬地)", "info", 0, None),
+    "foot_lr_diff": ("左右脚俯仰差 °", "err", 3.0, None),
     "slip_cms": ("踩地打滑 cm/s", "err", 2.0, None),
     "random_fall": ("随机换指令 20 秒摔倒(人/1024)", "err", 3, None),
 }
@@ -101,7 +102,8 @@ def run_pose(env, act, K=32, seconds=10.0):
     keep = [k for k in range(K) if not fell[k]]
     xp, xq, con = xp.cpu().numpy(), xq.cpu().numpy(), con.cpu().numpy()
     st = gait_stats([(xp[:, k], xq[:, k], con[:, k]) for k in keep], names, env.dt)
-    return {k: float(st[k]) for k in ("pelvis_roll", "pelvis_yaw", "width_cm", "head_pitch", "clear_cm", "land_toe_up", "push_off", "slip_cms")}
+    return {k: float(st[k]) for k in ("pelvis_roll", "pelvis_yaw", "width_cm", "head_pitch", "clear_cm", "land_toe_up", "push_off", "slip_cms",
+                                         "foot_lr_diff")}
 
 
 @torch.no_grad()

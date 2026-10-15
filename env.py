@@ -45,10 +45,13 @@ REWARD = dict(
     heel_down=0.0,     # 每次着地的前 70%(按步态时钟)脚跟要踩实: 罚脚尖朝下(踮脚); 最后 30% 留给蹬地, 落地时脚尖朝上不罚。例如 2.0
     toe_off=0.0,       # 每次着地的最后 30% 脚还踩着地时脚跟抬起、脚尖压地(蹬地)给奖励, 压到 20° 封顶(每只脚最多 1)。例如 0.5
     swing_flat=0.0,    # 摆动中段(进度 25%~75%)脚要放平: 罚脚相对地面前后倾斜(朝上朝下都罚)。例如 2.0
+    foot_flat=0.0,     # 罚着地时脚尖翘着(heel_down 只罚朝下): 着地前 20% 脚跟着地, 脚尖最多翘 LAND_TOE_UP; 20%~70% 脚踩平, 脚尖不许翘。例如 6.0
+    heel_strike=0.0,   # 每次着地的前 15% 脚踩着地时脚尖翘起(脚跟先着地)给奖励, 翘到 15° 封顶(每只脚最多 1); 和 toe_off 对称。例如 0.5
     foot_clear=0.0,    # 步态时钟说该摆动的脚, 离地高度要跟上 FOOT_CLEAR_H * sin(pi * 摆动进度), 低了就罚。例如 1.0
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
 FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原点平放时离地 0.027)。真人摆到中途脚底只离地几厘米; 定成 10 cm 会逼出踮脚走
+LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
 
 
 def quat_to_gravity(q):
@@ -104,7 +107,26 @@ def arm_swing_dirs(mjm, pose):
         out[f"shoulder1_{side}"], out[f"shoulder2_{side}"] = float(sol[0]), float(sol[1])
     return out
 
-# 观测块: 名字 -> 说明。实际计算在 HumanoidEnv._block_fns 里; 新加输入就在那里加一项, 不要改已有块的含义和缩放
+def mirror_joints(mjm, jid, names):
+    """左右镜像(关于躯干的前后-竖直平面)时每个关节对应哪个关节、角度变不变号。
+    右边的关节对应左边同名的, 躯干和脖子对应自己。转轴是赝矢量, 镜像后 a -> -M a(M = diag(1,-1,1)), 和对应关节的转轴同向就不变号。
+    站直姿势下检查转轴和转动中心确实是镜像的, 不是就报错(身体不对称时镜像约束没有意义)。"""
+    d = mujoco.MjData(mjm)
+    mujoco.mj_kinematics(mjm, d)
+    M = np.diag([1.0, -1.0, 1.0])
+    perm, sign = [], []
+    for i, n in enumerate(names):
+        p = n[:-5] + "left" if n.endswith("right") else n[:-4] + "right" if n.endswith("left") else n
+        k = names.index(p)
+        c = float(-M @ d.xaxis[jid[i]] @ d.xaxis[jid[k]])
+        assert abs(abs(c) - 1) < 1e-3 and np.allclose(M @ d.xanchor[jid[i]], d.xanchor[jid[k]], atol=1e-3), f"关节 {n} 和 {p} 不是左右镜像"
+        perm.append(k)
+        sign.append(1.0 if c > 0 else -1.0)
+    return perm, sign
+
+
+# 观测块: 名字 -> 说明。实际计算在 HumanoidEnv._block_fns 里; 新加输入就在那里加一项, 同时在 HumanoidEnv._mirror_block 里写它的左右镜像;
+# 不要改已有块的含义和缩放
 OBS_BLOCKS = dict(
     gravity="重力方向(机体系)", lin_vel="线速度(机体系, x2)", ang_vel="角速度(机体系, x0.25)", joint_pos="关节角",
     joint_vel="关节速度(x0.05)", last_action="上一步动作", cmd="速度指令 vx,vy,wz", clock="步态时钟 sin/cos", gait="步态指令 步频,着地比例",
@@ -152,6 +174,7 @@ class HumanoidEnv:
             for i, n in enumerate(names):
                 if n in pose:
                     self.q_def[i] = pose[n]
+        self.mirror_perm, self.mirror_sign = mirror_joints(mjm, jid, names)
         self.scale = action_frac * (self.hi - self.lo)    # 每个关节动作 ±1 对应的角度幅度
         if arm_pose:
             self.scale[self.arm_idx] *= 0.5               # 手臂幅度减半, 不然探索阶段会乱甩
@@ -217,6 +240,9 @@ class HumanoidEnv:
         self.obs_layout = [(k, fns[k]().shape[1]) for k in self.obs_names]
         self.critic_layout = self.obs_layout + [(k, fns[k]().shape[1]) for k in self.priv_names]
         self.obs_dim, self.critic_dim = sum(d for _, d in self.obs_layout), sum(d for _, d in self.critic_layout)
+        # 左右镜像都是"带符号的排列": 镜像后 = x[:, 排列] * 符号
+        self.act_mirror = (torch.tensor(self.mirror_perm, device=self.dev), torch.tensor(self.mirror_sign, device=self.dev))
+        self.obs_mirror, self.critic_mirror = self._mirror_layout(self.obs_layout), self._mirror_layout(self.critic_layout)
         self.reset_idx(torch.arange(nworld, device=self.dev), fresh=True)
         self._sample_cmd(torch.arange(nworld, device=self.dev))
 
@@ -271,6 +297,31 @@ class HumanoidEnv:
             height=lambda: self.qpos[:, 2:3],
             foot_contact=lambda: self.contact,
         )
+
+    def _mirror_block(self, name):
+        """观测块的左右镜像 (块内排列, 符号)。机体系的矢量 y 分量变号; 角速度是赝矢量, x、z 变号;
+        关节按 mirror_joints; 速度指令里侧移和转向变号; 步态时钟差半个周期(左脚就是晚半个周期的右脚), sin、cos 都变号。"""
+        jp, js = self.mirror_perm, self.mirror_sign
+        table = dict(gravity=([0, 1, 2], [1, -1, 1]), lin_vel=([0, 1, 2], [1, -1, 1]), ang_vel=([0, 1, 2], [-1, 1, -1]),
+                     joint_pos=(jp, js), joint_vel=(jp, js), last_action=(jp, js), cmd=([0, 1, 2], [1, -1, -1]), clock=([0, 1], [-1, -1]),
+                     gait=([0, 1], [1, 1]), height=([0], [1]), foot_contact=([1, 0], [1, 1]))
+        assert name in table, f"观测块 {name} 没写左右镜像(_mirror_block)"
+        return table[name]
+
+    def _mirror_layout(self, layout):
+        perm, sign, o = [], [], 0
+        for name, d in layout:
+            p, s = self._mirror_block(name)
+            assert len(p) == d
+            perm += [o + i for i in p]
+            sign += s
+            o += d
+        return torch.tensor(perm, device=self.dev), torch.tensor(sign, dtype=torch.float32, device=self.dev)
+
+    @staticmethod
+    def mirror(x, ps):
+        """x: [..., 维数], ps: act_mirror / obs_mirror / critic_mirror。"""
+        return x[..., ps[0]] * ps[1]
 
     def _obs(self):
         fns = self._block_fns()
@@ -353,7 +404,7 @@ class HumanoidEnv:
             d = self.xpos[:, self.foot_ids[1], :2] - self.xpos[:, self.foot_ids[0], :2]
             lat = -s * d[:, 0] + c * d[:, 1]
             r = r - rw["step_width"] * ((STEP_WIDTH_MIN - lat).clamp(min=0) / STEP_WIDTH_MIN).clamp(max=1) ** 2
-        if rw["heel_down"] or rw["toe_off"] or rw["swing_flat"]:
+        if rw["heel_down"] or rw["toe_off"] or rw["swing_flat"] or rw["foot_flat"] or rw["heel_strike"]:
             # 按步态时钟分段: 着地前 70% 脚跟踩实, 着地最后 30% 蹬地, 摆动中段脚放平
             ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
             D = self.gait[:, 1:2]
@@ -365,6 +416,11 @@ class HumanoidEnv:
             r = r + rw["toe_off"] * (late * (sin_down.clamp(min=0) / math.sin(math.radians(20))).clamp(max=1)).sum(dim=1)
             mid_swing = (ph >= D) & (swing_prog >= 0.25) & (swing_prog < 0.75)
             r = r - rw["swing_flat"] * (mid_swing * sin_down ** 2).sum(dim=1)
+            # 只有 heel_down 时脚尖朝上不罚, 策略可以一只脚整个着地期用脚跟走、脚尖一直翘着(style_trial6/7 的右脚)
+            up_ok = (ph < 0.2 * D) * math.sin(math.radians(LAND_TOE_UP))
+            r = r - rw["foot_flat"] * ((ph < 0.7 * D) * (-sin_down - up_ok).clamp(min=0) ** 2).sum(dim=1)
+            early = (ph < 0.15 * D) & (self.contact > 0)
+            r = r + rw["heel_strike"] * (early * (-sin_down).clamp(min=0) / math.sin(math.radians(15))).clamp(max=1).sum(dim=1)
         if rw["foot_clear"]:                               # 摆动进度 0 -> 1 时目标高度 0 -> H -> 0; 只罚低于目标
             ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
             D = self.gait[:, 1:2]
