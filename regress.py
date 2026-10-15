@@ -26,6 +26,7 @@ from policy import load_policy
 METRICS = {
     "vx_err": ("前进速度误差(最大, m/s)", "err", 0.05, None),
     "back_err": ("倒退速度误差(最大, m/s)", "err", 0.05, None),
+    "vy_err": ("侧移速度误差(最大, m/s)", "err", 0.05, None),
     "stand_move": ("站定时漂移 m/s", "err", 0.03, None),
     "stand_steps": ("站定时踏步 步/分", "err", 3, None),
     "wz_err": ("转向误差(最大, rad/s)", "err", 0.05, None),
@@ -50,18 +51,20 @@ def mid(r):
 
 
 FWD_POINTS, BACK_POINTS = (0.4, 0.8, 1.2), (-0.3, -0.6)   # 速度测点(只取训练范围里的), 外加范围两端
+SIDE_POINTS = (-0.4, -0.2, 0.2, 0.4)                       # 侧移测点(前进速度 0, 只取训练范围里的)
 WALK_V = 0.8                                               # 转向、步态网格测验时的前进速度(不在训练范围里就取中点)
 
 
 def run_tracking(env, act):
     """测验 1 和 2: 每个人形一个固定指令。返回 (指标, 明细行)。
     测点固定(而不是取范围两端和中点), 这样放宽指令范围后, 前进、转向、步态这几项还能和旧基线逐项比。"""
-    (vx_r, _, wz_r), (f_r, d_r) = env.cmd_rng, env.gait_rng
+    (vx_r, vy_r, wz_r), (f_r, d_r) = env.cmd_rng, env.gait_rng
     g_mid = (mid(f_r), mid(d_r))
     inside = lambda v: vx_r[0] <= v <= vx_r[1]
     walk = WALK_V if inside(WALK_V) else mid(vx_r)
     pts = sorted({v for v in FWD_POINTS + BACK_POINTS if inside(v)} | {vx_r[0], vx_r[1]})
     combos = [("vx" if v > 0 else "back", (v, 0.0, 0.0), g_mid) for v in pts if v != 0]
+    combos += [("vy", (0.0, v, 0.0), g_mid) for v in SIDE_POINTS if vy_r[0] <= v <= vy_r[1]]
     combos += [("wz", (walk, 0.0, w), g_mid) for w in sorted({wz_r[0], wz_r[1]}) if w != 0]
     combos += [("gait", (walk, 0.0, 0.0), (f, d)) for f in sorted({f_r[0], mid(f_r), f_r[1]}) for d in sorted({d_r[0], mid(d_r), d_r[1]})]
     if env.stand_prob > 0:
@@ -81,6 +84,8 @@ def run_tracking(env, act):
         if kind in ("vx", "back"):
             key = "vx_err" if kind == "vx" else "back_err"
             out[key] = max(out.get(key, 0.0), abs(m("vx") - c[0]))
+        elif kind == "vy":
+            out["vy_err"] = max(out.get("vy_err", 0.0), abs(m("vy") - c[1]))
         elif kind == "wz":
             out["wz_err"] = max(out["wz_err"], abs(m("wz") - c[2]))
         elif kind == "gait":
@@ -88,7 +93,7 @@ def run_tracking(env, act):
             out["duty_err"] = max(out["duty_err"], abs(m("duty") - g[1]))
         else:                                              # 站定: 不该走, 也不该原地踏步
             out["stand_move"], out["stand_steps"] = abs(m("vx")), m("freq") * 120
-        rows.append(f"  指令 vx {c[0]:4.2f} wz {c[2]:+4.2f} 步频 {g[0] * 120:3.0f} 着地 {g[1]:.2f} | 实际 vx {m('vx'):4.2f} wz {m('wz'):+5.2f}"
+        rows.append(f"  指令 vx {c[0]:4.2f} vy {c[1]:+4.2f} wz {c[2]:+4.2f} 步频 {g[0] * 120:3.0f} 着地 {g[1]:.2f} | 实际 vx {m('vx'):4.2f} vy {m('vy'):+5.2f} wz {m('wz'):+5.2f}"
                     f" 步频 {m('freq') * 120:3.0f} 着地 {m('duty'):.2f} | 摔 {int((~ok).sum())}/{reps}")
     return out, rows
 
@@ -103,7 +108,7 @@ def run_pose(env, act, K=32, seconds=10.0):
     env.cmd_period = env.ep_len = 10 ** 9
     env.reset_idx(torch.arange(env.n, device=env.dev))
     env.t[:] = 0
-    env.cmd[:], env.gait[:] = cmd, gt
+    env.set_cmd(cmd, gt)
     T = int(seconds / env.dt)
     xp, xq, con = (torch.zeros(T, K, *shape, device=env.dev) for shape in ((env.xpos.shape[1], 3), (env.xpos.shape[1], 4), (2,)))
     fell = torch.zeros(env.n, dtype=torch.bool, device=env.dev)
@@ -112,7 +117,7 @@ def run_pose(env, act, K=32, seconds=10.0):
         obs, _ = env.observe()
         _, _, _, te, _, _ = env.step(act(obs))
         fell |= te
-        env.cmd[:], env.gait[:] = cmd, gt
+        env.set_cmd(cmd, gt)
     names = [mujoco.mj_id2name(env.mjm, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(env.mjm.nbody)]
     keep = [k for k in range(K) if not fell[k]]
     xp, xq, con = xp.cpu().numpy(), xq.cpu().numpy(), con.cpu().numpy()

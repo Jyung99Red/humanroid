@@ -296,6 +296,23 @@ class PPO:
         self.ret_mean, self.ret_std, self.ret_init = s["ret"]
         self.lr, self.iteration = s["lr"], s["iteration"]
         self.opt.param_groups[0]["lr"] = self.lr
+        self._revive_constant_inputs()
+
+    @torch.no_grad()
+    def _revive_constant_inputs(self, tol=1e-6):
+        """检查点里从没变过的输入(方差几乎为 0, 例如一直是 0 的侧移指令)当成新输入: 统计量重置、第一层对应的列和 Adam 动量清零。
+        这些输入以前归一化后恒为 0, 列清零不改变已有行为。不处理的话: 计数已经上亿, 放宽指令范围后方差几乎不更新,
+        新指令归一化后被放大到 ±10, 再乘上从没训练过的随机权重(stand3 收到侧移指令时一边全摔、一边不动)。"""
+        for rms, layer in ((self.obs_rms, self.ac.actor[0]), (self.crit_rms, self.ac.critic[0])):
+            dead = (rms.var < tol).nonzero().flatten()
+            if not len(dead):
+                continue
+            rms.var[dead], rms.count[dead] = 1.0, 1e-4
+            layer.weight[:, dead] = 0.0
+            for m in ("exp_avg", "exp_avg_sq"):
+                if m in self.opt.state.get(layer.weight, {}):
+                    self.opt.state[layer.weight][m][:, dead] = 0.0
+            print(f"{'演员' if layer is self.ac.actor[0] else '评论家'}的输入第 {dead.tolist()} 维以前从没变过, 当新输入处理(统计量重置, 权重从零开始)")
 
 
 def default_layouts(nu):

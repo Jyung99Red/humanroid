@@ -15,18 +15,19 @@ from policy import load_policy
 
 @torch.no_grad()
 def measure(env, act, cmd, gait, seconds=8.0, warm=2.0):
-    """cmd [K,3], gait [K,2] 逐个人形固定。返回 dict(每个人形的 freq, duty, vx, wz, fell), 都是 [K] 张量。"""
+    """cmd [K,3], gait [K,2] 逐个人形固定。返回 dict(每个人形的 freq, duty, vx, vy, wz, fell), 都是 [K] 张量。"""
     K = env.n
     env.cmd_period = env.ep_len = 10 ** 9                  # 测验期间不换指令、不超时
     idx = torch.arange(K, device=env.dev)
     env.reset_idx(idx)
     env.t[:] = 0
-    env.cmd[:], env.gait[:] = cmd, gait
+    env.set_cmd(cmd, gait)
     steps, w = int(seconds / env.dt), int(warm / env.dt)
     fell = torch.zeros(K, dtype=torch.bool, device=env.dev)
     touch = torch.zeros(K, 2, device=env.dev)
     on = torch.zeros(K, 2, device=env.dev)
     vx = torch.zeros(K, device=env.dev)
+    vy = torch.zeros(K, device=env.dev)
     wz = torch.zeros(K, device=env.dev)
     off = torch.zeros(K, 2, device=env.dev)               # 每只脚连续离地了几步
     n = 0
@@ -34,17 +35,18 @@ def measure(env, act, cmd, gait, seconds=8.0, warm=2.0):
         obs, _ = env.observe()
         _, _, _, te, _, _ = env.step(act(obs))
         fell |= te
-        env.cmd[:], env.gait[:] = cmd, gait                 # 摔倒重置后会重抽指令, 改回来(摔了的人形不计入结果)
+        env.set_cmd(cmd, gait)                 # 摔倒重置后会重抽指令, 改回来(摔了的人形不计入结果)
         if t >= w:
             live = (~fell).float()
             touch += ((env.contact > 0) & (off >= 2)).float() * live[:, None]
             on += env.contact * live[:, None]
             vx += env.m_vx * live
+            vy += env.m_vy * live
             wz += env.qvel[:, 5] * live
             n += 1
         off = torch.where(env.contact > 0, torch.zeros_like(off), off + 1)
     T = n * env.dt
-    return dict(freq=touch.mean(1) / T, duty=on.mean(1) / n, vx=vx / n, wz=wz / n, fell=fell)
+    return dict(freq=touch.mean(1) / T, duty=on.mean(1) / n, vx=vx / n, vy=vy / n, wz=wz / n, fell=fell)
 
 
 def grid_report(env, act, vx, freqs, duties, wz=0.0):

@@ -56,13 +56,16 @@ with torch.no_grad():
     for t in range(T):
         if seq:
             c = [x for k, x in seq if k <= t * env.dt + 1e-9][-1]
-            env.cmd[:] = torch.tensor(c[:3], device=env.dev)
-            env.gait[:] = torch.tensor(c[3:5], device=env.dev) if len(c) >= 5 else gait0
+            cmd, gait = torch.tensor(c[:3], device=env.dev), torch.tensor(c[3:5], device=env.dev) if len(c) >= 5 else gait0
+            if env.cmd_acc is None:
+                env.set_cmd(cmd, gait)
+            else:                                                # 训练时有指令加速度限制: 只改目标, 让指令按限制过渡
+                env.cmd_goal[:], env.gait_goal[:] = cmd, gait
             wz = c[2]
         if a.hold_heading > 0 and env.cmd[0].abs().sum() > 0:      # 偏航角 -> 转向指令(限制在训练时见过的范围内), 然后让观测反映这个指令
             qq = env.qpos[:, 3:7]
             yaw = torch.atan2(2 * (qq[:, 0] * qq[:, 3] + qq[:, 1] * qq[:, 2]), 1 - 2 * (qq[:, 2] ** 2 + qq[:, 3] ** 2))
-            env.cmd[:, 2] = (wz - a.hold_heading * yaw).clamp(-0.3, 0.3)
+            env.cmd[:, 2] = env.cmd_goal[:, 2] = (wz - a.hold_heading * yaw).clamp(-0.3, 0.3)
         obs, _ = env.observe()
         q_hist[t] = env.qpos
         c_hist[t] = env.contact.to(torch.uint8)

@@ -144,17 +144,19 @@ class HumanoidEnv:
     def __init__(self, nworld, xml="models/humanoid_pd.xml", decimation=4, ep_len=500, action_frac=0.3,
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
-                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0):
+                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
         self.priv_names = [k for k in priv if k not in self.obs_names]     # 演员已经看到的块, 评论家不重复
         self.dec, self.ep_len, self.act_clip = decimation, ep_len, act_clip
-        self.cmd_period, self.random_yaw = cmd_period, random_yaw
+        self.cmd_period, self.random_yaw = cmd_period, random_yaw   # 多少步换一次指令: 一个数, 或 (lo, hi) 每次在里面随机抽
         self.cmd_rng = (cmd_vx, cmd_vy, cmd_wz)
         # 步态指令的范围; 没给步频就用固定的 1 / gait_period(旧配置只有 gait_period)
         self.gait_rng = (cmd_freq or (1.0 / gait_period, 1.0 / gait_period), cmd_duty)
         self.stand_prob = cmd_stand                       # 抽指令时有这么大概率是"站定": 速度全 0、着地比例 1
+        # 指令加速度限制(m/s^2, 转向 rad/s^2 同值): 新抽的指令是目标, 实际指令每步最多变 cmd_acc * dt。None = 瞬间换(旧策略)
+        self.cmd_acc = cmd_acc
         self.rw = dict(REWARD, **(reward or {}))
         torch.manual_seed(seed)
         wp.init()
@@ -236,11 +238,13 @@ class HumanoidEnv:
         self.prev_action = torch.zeros_like(self.action)
         self.cmd = torch.zeros(nworld, 3, **f)
         self.gait = torch.zeros(nworld, 2, **f)              # 步频 f(周期/秒), 着地比例 D
+        self.cmd_goal, self.gait_goal = torch.zeros_like(self.cmd), torch.zeros_like(self.gait)   # 有加速度限制时 cmd/gait 往这里靠
         self.phase = torch.rand(nworld, **f)
         self.contact = torch.ones(nworld, 2, **f)
         # 开局把各环境的回合进度打散, 避免同时超时、同时重置
         self.t = torch.randint(0, ep_len, (nworld,), device=self.dev)
-        self.cmd_t = torch.randint(0, cmd_period, (nworld,), device=self.dev)
+        self.cmd_t = torch.randint(0, cmd_period if isinstance(cmd_period, int) else cmd_period[1], (nworld,), device=self.dev)
+        self.cmd_due = torch.zeros(nworld, dtype=torch.long, device=self.dev)   # 每个世界这次指令持续多少步
         fns = self._block_fns()
         self.obs_layout = [(k, fns[k]().shape[1]) for k in self.obs_names]
         self.critic_layout = self.obs_layout + [(k, fns[k]().shape[1]) for k in self.priv_names]
@@ -250,6 +254,7 @@ class HumanoidEnv:
         self.obs_mirror, self.critic_mirror = self._mirror_layout(self.obs_layout), self._mirror_layout(self.critic_layout)
         self.reset_idx(torch.arange(nworld, device=self.dev), fresh=True)
         self._sample_cmd(torch.arange(nworld, device=self.dev))
+        self.cmd[:], self.gait[:] = self.cmd_goal, self.gait_goal
 
     # ---------------- 重置 ----------------
     def reset_idx(self, idx, fresh=False):
@@ -280,14 +285,32 @@ class HumanoidEnv:
     def _sample_cmd(self, idx):
         k = idx.numel()
         for j, (lo, hi) in enumerate(self.cmd_rng):
-            self.cmd[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
+            self.cmd_goal[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
         for j, (lo, hi) in enumerate(self.gait_rng):
-            self.gait[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
+            self.gait_goal[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
         if self.stand_prob > 0:
             st = idx[torch.rand(k, device=self.dev) < self.stand_prob]
-            self.cmd[st] = 0.0
-            self.gait[st, 1] = 1.0
+            self.cmd_goal[st] = 0.0
+            self.gait_goal[st, 1] = 1.0
+        if self.cmd_acc is None:
+            self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
+        p = self.cmd_period
+        self.cmd_due[idx] = p if isinstance(p, int) else torch.randint(p[0], p[1] + 1, (k,), device=self.dev)
         self.cmd_t[idx] = 0
+
+    def set_cmd(self, cmd, gait=None):
+        """测验、回放直接定指令(立即生效, 不走加速度限制): 实际指令和目标一起改。cmd [n,3] 或 [3], gait [n,2] 或 [2]。"""
+        self.cmd[:], self.cmd_goal[:] = cmd, cmd
+        if gait is not None:
+            self.gait[:], self.gait_goal[:] = gait, gait
+
+    def _ramp_cmd(self):
+        """实际指令按加速度限制往目标靠。步频直接换; 着地比例: 目标是站定(1)时, 等速度降到 0 再换(否则"还在走却要两脚都着地"), 其他直接换。"""
+        step = self.cmd_acc * self.dt
+        self.cmd += (self.cmd_goal - self.cmd).clamp(-step, step)
+        moving = self.cmd.abs().sum(dim=1) > 1e-6
+        self.gait[:, 0] = self.gait_goal[:, 0]
+        self.gait[:, 1] = torch.where((self.gait_goal[:, 1] >= 1) & moving & (self.gait[:, 1] < 1), self.gait[:, 1], self.gait_goal[:, 1])
 
     # ---------------- 观测 ----------------
     def _block_fns(self):
@@ -379,7 +402,7 @@ class HumanoidEnv:
 
         rw = self.rw
         lin_err = (vx_h - self.cmd[:, 0]) ** 2 + (vy_h - self.cmd[:, 1]) ** 2
-        self.m_lin_err, self.m_vx = lin_err, vx_h          # 给训练日志看的监控量
+        self.m_lin_err, self.m_vx, self.m_vy = lin_err, vx_h, vy_h     # 给训练日志、测验看的监控量(朝向坐标系)
         r = rw["lin_vel"] * torch.exp(-lin_err / 0.25)
         r = r + rw["ang_vel"] * torch.exp(-((wz - self.cmd[:, 2]) ** 2) / 0.25)
         if rw["lin_vel_fine"] or rw["ang_vel_fine"]:       # 宽的项保证离得远时也有梯度, 窄的项管跟得准
@@ -477,8 +500,11 @@ class HumanoidEnv:
 
         idx = done.nonzero(as_tuple=False).squeeze(1)
         self.reset_idx(idx)
-        due = (self.cmd_t >= self.cmd_period) | done
+        due = (self.cmd_t >= self.cmd_due) | done
         self._sample_cmd(due.nonzero(as_tuple=False).squeeze(1))
+        if self.cmd_acc is not None:                       # 重新开局的直接用新指令, 其他的按加速度限制往目标靠
+            self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
+            self._ramp_cmd()
         obs, critic = self._obs()
         return obs, critic, r, terminated, truncated, info
 

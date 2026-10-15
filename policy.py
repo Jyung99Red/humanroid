@@ -10,7 +10,7 @@ from ppo import RunningMeanStd, mlp
 
 # 环境设置里这些键会原样传给 HumanoidEnv; 旧策略文件没有的键用 HumanoidEnv 的默认值
 ENV_KEYS = ("xml", "obs", "ep_len", "action_frac", "reward", "arm_pose", "arm_swing_amp", "gait_period", "cmd_vx", "cmd_vy", "cmd_wz",
-            "cmd_freq", "cmd_duty", "cmd_stand")
+            "cmd_freq", "cmd_duty", "cmd_stand", "cmd_acc", "cmd_period")
 
 
 def load_policy(path, nworld, **overrides):
