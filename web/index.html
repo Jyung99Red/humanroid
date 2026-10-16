@@ -29,9 +29,15 @@
   #bar button:hover, #bar select:hover { border-color:var(--acc); }
   #scrub { flex:1 1 220px; min-width:140px; accent-color:var(--acc); }
   #time { font-variant-numeric:tabular-nums; color:var(--dim); min-width:92px; text-align:right; }
+  #tl { flex:1 1 100%; display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; padding-bottom:8px; border-bottom:1px solid var(--line); }
+  #tl .k { color:var(--dim); }
+  #tlScrub { flex:1 1 220px; min-width:140px; accent-color:#7cc4ff; }
+  #tlInfo { font-variant-numeric:tabular-nums; min-width:150px; }
+  #tlInfo b { color:#7cc4ff; font-weight:600; }
+  #runs label .tlmark { color:#7cc4ff; font-size:12px; }
   #msg { position:fixed; inset:0; display:none; place-items:center; text-align:center; color:var(--dim); padding:24px; }
   [hidden] { display:none !important; }
-  @media (max-width:640px) { #side { display:none; } }
+  @media (max-width:640px) { #side { display:none; } #top { max-height:38vh; overflow:auto; } }
 </style>
 <script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/":"./vendor/"}}</script>
 </head>
@@ -41,10 +47,17 @@
 <div class="panel" id="top">
   <h1>人形训练回放</h1>
   <div id="runs"></div>
-  <div id="hint">勾选多个训练阶段可以同台对比 · 空格 播放/暂停 · ←/→ 快退/快进 · 鼠标拖动旋转，滚轮缩放</div>
+  <div id="hint">勾选多个训练阶段可以同台对比 · 空格 播放/暂停 · ←/→ 快退/快进 · 时间线：拖"轮数"或按 ↑/↓ 换快照 · 鼠标拖动旋转，滚轮缩放</div>
 </div>
 <div class="panel" id="side"></div>
 <div class="panel" id="bar">
+  <div id="tl" hidden>
+    <span class="k">轮数</span>
+    <button id="tlPrev" aria-label="上一个快照">◀</button>
+    <input id="tlScrub" type="range" min="0" max="0" value="0" aria-label="训练轮数">
+    <button id="tlNext" aria-label="下一个快照">▶</button>
+    <span id="tlInfo"></span>
+  </div>
   <button id="play">暂停</button>
   <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="时间轴">
   <span id="time">0.00 / 0.00 s</span>
@@ -130,8 +143,33 @@ async function loadRun(file) {
   if (runCache.has(file)) return runCache.get(file);
   const r = await fetch('replays/' + file + '?v=' + Date.now());
   if (!r.ok) throw new Error(file + ' 加载失败 (' + r.status + ')');
-  const d = await r.json(); runCache.set(file, d); return d;
+  const d = await r.json();
+  if (d.type === 'timeline') {                     // 时间线: 只有清单, 每个快照的轨迹按需下载(snapIdx 指当前显示的快照)
+    d.timeline = true; d.dir = file.slice(0, file.lastIndexOf('/') + 1); d.cap = d.steps;
+    d.meta = { label: d.label, dt: d.dt }; d.snapIdx = -1; d.worlds = null;
+  }
+  runCache.set(file, d); return d;
 }
+
+// 时间线的快照: .bin 按世界依次是 位置 int16(毫米)、朝向 int16(×32767)、前进速度 int16(毫米/秒)、两脚接触 uint8(见 export_timeline.py)
+const snapBufs = new Map();                          // url -> Promise<ArrayBuffer>, 拖滑块来回看时不重复下载
+function snapBuf(d, i) {
+  const url = 'replays/' + d.dir + d.snaps[i].file + '?v=' + d.version;
+  if (!snapBufs.has(url)) snapBufs.set(url, fetch(url).then((r) => { if (!r.ok) throw new Error(url + ' 加载失败 (' + r.status + ')'); return r.arrayBuffer(); }));
+  return snapBufs.get(url);
+}
+async function loadSnap(d, i) {
+  const buf = await snapBuf(d, i), nb = d.bodies.length, sc = d.scale, worlds = [];
+  let off = 0;
+  const take = (len, k) => { const a = new Int16Array(buf, off, len), f = new Float32Array(len); for (let j = 0; j < len; j++) f[j] = a[j] / k; off += len * 2; return f; };
+  for (const w of d.snaps[i].worlds) {
+    const n = w.n, xpos = take(n * nb * 3, sc.pos), xquat = take(n * nb * 4, sc.quat), vx = take(n, sc.vx);
+    const contact = new Uint8Array(buf, off, n * 2); off += n * 2;
+    worlds.push({ n, fell: w.fell, xpos, xquat, vx, contact });
+  }
+  return worlds;
+}
+function prefetch(d) { let p = Promise.resolve(); d.snaps.forEach((_, i) => { p = p.then(() => snapBuf(d, i)).catch(() => {}); }); }   // 后台按顺序把所有快照下载好
 
 // ---------- 造型参数(只影响外观, 和物理、训练完全无关)。想改造型就改这里的数, 刷新页面生效 ----------
 const LOOK = {
@@ -416,7 +454,7 @@ function buildRun(data, runIdx, laneStart) {
     const { links, skel } = dressCharacter(data, bodyObjs, mats);
     // 躯干走过的路线(画在地上)
     const trailGeo = new THREE.BufferGeometry();
-    trailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(w.n * 3), 3));
+    trailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(Math.max(w.n, data.cap || 0) * 3), 3));   // 时间线换快照时帧数会变, 按最大的开
     trailGeo.setDrawRange(0, 0);
     const trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color: shirt, transparent: true, opacity: 0.85 }));
     trail.frustumCulled = false; wg.add(trail);
@@ -424,8 +462,20 @@ function buildRun(data, runIdx, laneStart) {
     return { w, bodyObjs, mats, links, skel, trail, lane, shirt, x0, y0, nb };
   });
   const dt = data.meta.dt;
-  return { data, group, worlds, dt, runIdx, laneStart, nLanes: worlds.length, label: data.meta.label,
+  return { data, group, worlds, dt, runIdx, laneStart, nLanes: worlds.length, label: runLabel(data),
            dur: Math.max(...data.worlds.map((w) => (w.n - 1) * dt), dt) };
+}
+const runLabel = (d) => d.timeline ? `${d.meta.label} · 第 ${d.snaps[d.snapIdx].it} 轮` : d.meta.label;
+function putTag(r) {                                 // 跑道上方的名牌(时间线换快照时要换字)
+  if (r.tag) { deco.remove(r.tag); r.tag.material.map.dispose(); r.tag.material.dispose(); }
+  r.tag = textSprite(r.label, '#ffe9b0', 56); r.tag.position.set(-1.6, 1.9, (r.laneStart + (r.nLanes - 1) / 2) * LANE); r.tag.scale.set(3.2, 0.8, 1); deco.add(r.tag);
+}
+function setWorlds(r, worlds, i) {                   // 时间线换成第 i 个快照: 人形不重建, 只换轨迹数据; 时间点不变
+  r.data.worlds = worlds; r.data.snapIdx = i;
+  r.worlds.forEach((W, k) => { W.w = worlds[k]; W.x0 = W.w.xpos[3]; W.y0 = W.w.xpos[4]; });
+  r.dur = Math.max(...worlds.map((w) => (w.n - 1) * r.dt), r.dt);
+  r.label = runLabel(r.data);
+  total = Math.max(...runs.map((x) => x.dur));
 }
 
 function applyWorld(run, W, t) {
@@ -481,6 +531,10 @@ async function show(files) {
   const my = ++showToken;
   if (!files.length) return;
   const datas = await Promise.all(files.map(loadRun));
+  for (const d of datas) if (d.timeline) {           // 默认最后一个快照; 链接里给了 it=轮数 就取最接近的
+    const i = d.snapIdx >= 0 ? d.snapIdx : params.has('it') ? nearestSnap(d, +params.get('it')) : d.snaps.length - 1;
+    d.worlds = await loadSnap(d, i); d.snapIdx = i;
+  }
   if (my !== showToken) return;                      // 等待期间用户又选了别的, 这一次作废
   clearRuns(); selected = files;
   let lanes = 0, built = [];
@@ -499,7 +553,7 @@ async function show(files) {
         new THREE.MeshStandardMaterial({ color: r.runIdx % 2 ? 0xb9855a : 0xc59a6d, roughness: 0.95 }));
       strip.position.set(length / 2 - 8, 0.004, z); strip.receiveShadow = true; deco.add(strip);
     }
-    const tag = textSprite(r.label, '#ffe9b0', 56); tag.position.set(-1.6, 1.9, (r.laneStart + (r.nLanes - 1) / 2) * LANE); tag.scale.set(3.2, 0.8, 1); deco.add(tag);
+    r.tag = null; putTag(r);
   });
   const zc = LANE * (lanes - 1) / 2;
   const line = new THREE.Mesh(new THREE.PlaneGeometry(0.12, LANE * lanes).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0xffffff }));
@@ -517,7 +571,39 @@ async function show(files) {
   document.querySelectorAll('#runs label').forEach((l) => {            // 勾选状态和当前显示保持一致
     const on = files.includes(l.dataset.file); l.classList.toggle('on', on); l.querySelector('input').checked = on;
   });
+  syncTimelineBar();
+  for (const r of runs) if (r.data.timeline) prefetch(r.data);
 }
+
+// ---------- 时间线: 轮数滑块 ----------
+function nearestSnap(d, it) { let b = 0; d.snaps.forEach((s, i) => { if (Math.abs(s.it - it) < Math.abs(d.snaps[b].it - it)) b = i; }); return b; }
+const tlRuns = () => runs.filter((r) => r.data.timeline);
+function syncTimelineBar() {
+  const tl = tlRuns(); $('tl').hidden = !tl.length;
+  if (!tl.length) return;
+  const d = tl[0].data, s = d.snaps[d.snapIdx];
+  $('tlScrub').max = d.snaps.length - 1;
+  if (document.activeElement !== $('tlScrub')) $('tlScrub').value = d.snapIdx;
+  const dead = s.worlds.filter((w) => w.fell).length;
+  $('tlInfo').innerHTML = `<b>第 ${s.it} 轮</b> · ${s.run} · ${d.snapIdx + 1}/${d.snaps.length}` + (dead ? ` · 摔 ${dead}/${s.worlds.length}` : '');
+}
+let iterToken = 0;
+async function setIter(i) {                          // 第一条时间线换到第 i 个快照, 其他时间线取轮数最接近的
+  const tl = tlRuns(); if (!tl.length) return;
+  const d0 = tl[0].data; i = Math.max(0, Math.min(d0.snaps.length - 1, i));
+  const it = d0.snaps[i].it, my = ++iterToken;
+  const picks = tl.map((r, k) => (k === 0 ? i : nearestSnap(r.data, it)));
+  const loaded = await Promise.all(tl.map((r, k) => loadSnap(r.data, picks[k])));
+  if (my !== iterToken) return;                      // 拖得快, 只认最后一次
+  tl.forEach((r, k) => {
+    setWorlds(r, loaded[k], picks[k]); putTag(r);
+    for (const W of r.worlds) if (W.el) W.el.querySelector('.nm').textContent = `${r.label} · 道 ${W.lane - r.laneStart + 1}`;
+  });
+  syncTimelineBar();
+}
+$('tlScrub').oninput = (e) => setIter(+e.target.value).catch(fail);
+$('tlPrev').onclick = () => setIter(tlRuns()[0].data.snapIdx - 1).catch(fail);
+$('tlNext').onclick = () => setIter(tlRuns()[0].data.snapIdx + 1).catch(fail);
 
 function buildSide() {
   const side = $('side'); side.innerHTML = '';
@@ -533,7 +619,7 @@ function buildPicker() {
   const box = $('runs'); box.innerHTML = '';
   for (const e of index) {
     const l = document.createElement('label'); l.dataset.file = e.file;
-    l.innerHTML = `<input type="checkbox"><span>${e.label}</span>`;
+    l.innerHTML = `<input type="checkbox"><span>${e.label}</span>` + (e.timeline ? '<span class="tlmark">· 轮数可拖</span>' : '');
     l.querySelector('input').addEventListener('change', () => {
       const on = [...box.querySelectorAll('label')].filter((x) => x.querySelector('input').checked).map((x) => x.dataset.file);
       show(on.length ? on : [e.file]).catch(fail);
@@ -549,6 +635,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
   else if (e.code === 'ArrowLeft') time = Math.max(0, time - 0.25);
   else if (e.code === 'ArrowRight') time = Math.min(total, time + 0.25);
+  else if ((e.code === 'ArrowUp' || e.code === 'ArrowDown') && tlRuns().length) { e.preventDefault(); setIter(tlRuns()[0].data.snapIdx + (e.code === 'ArrowUp' ? 1 : -1)).catch(fail); }
 });
 function resize() { const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }
 addEventListener('resize', resize); resize();
@@ -607,7 +694,7 @@ try {
   await show(want.length ? want : [index[index.length - 1].file]);
   $('play').textContent = playing ? '暂停' : '播放';
 } catch (e) { fail(e); }
-window.__viewer = { get LOOK() { return LOOK; }, get time() { return time; }, set time(v) { time = v; }, get total() { return total; }, THREE, camera, controls, scene };
+window.__viewer = { get LOOK() { return LOOK; }, get time() { return time; }, set time(v) { time = v; }, get total() { return total; }, get runs() { return runs; }, setIter, THREE, camera, controls, scene };
 </script>
 </body>
 </html>

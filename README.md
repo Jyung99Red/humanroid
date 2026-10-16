@@ -14,14 +14,16 @@
 .venv\Scripts\python.exe train.py --resume runs/walk1/ckpt.pt --iters 500 --out runs/walk1   # 续训
 .venv\Scripts\python.exe export.py runs/walk1/policy.pt --worlds 6      # 导出回放到 web/replays/（--cmd vx,vy,wz  --gait 步频,着地比例）
 .venv\Scripts\python.exe export.py runs/xxx/policy.pt --steps 700 --seq "0:1.0,0,0; 4:0,0,0,0.925,1; 6.5:-0.4,0,0"   # 按时间换指令(秒:vx,vy,wz[,步频,着地比例]): 走 -> 站定 -> 倒退
+.venv\Scripts\python.exe export_timeline.py runs/knee3 --name knee3      # 整条训练链的所有快照导出成时间线, 回放页面拖"轮数"逐个看(默认指令: 走 -> 站 -> 倒退 -> 站)
 .venv\Scripts\python.exe eval_policy.py runs/xxx/policy.pt              # 测跟指令: 实际步频、着地比例、速度
 .venv\Scripts\python.exe regress.py runs/新/policy.pt --baseline runs/旧/regress.json --save   # 回归测验, 和基线比
 .venv\Scripts\python.exe foot_phase.py runs/xxx/policy.pt              # 按步态时钟分 10 段, 左右脚各自的俯仰(脚跟着地/踩平/蹬地对不对)
 .venv\Scripts\python.exe check_mirror.py runs/xxx/policy.pt             # 检查身体/观测/奖励左右对称、镜像映射写对; 顺带量策略多不对称
 viewer.bat                                                              # 起本地服务并打开回放页面
 ```
-- 训练日志：每轮一行，同时写 `runs/<名>/train_log.csv`。每 10 轮存 `ckpt.pt`（续训）和 `policy.pt`（回放），每 50 轮存快照到 `snaps/`。
+- 训练日志：每轮一行，同时写 `runs/<名>/train_log.csv`。每 10 轮存 `ckpt.pt`（续训）和 `policy.pt`（回放），每 50 轮存快照到 `snaps/`（`--snap-every`，每个约 330 KB，导出成时间线后约 0.5 MB；5000 轮约 100 个快照，硬盘 33 MB + 回放 50 MB）。
 - 回放：`export.py` 可导出任何快照；网页里勾选多个即同台对比。链接参数 `?r=文件1,文件2&t=秒&pause=1` 直达某个时刻。
+- 时间线：`export_timeline.py` 把一条训练链（顺着 `config.json` 的 `resume` 往回找）的所有快照用同一串指令跑一遍，网页里拖"轮数"滑块或按 ↑/↓ 逐个看，链接参数 `it=轮数`。再跑一次只补新快照。见"回放页面"。
 - 奖励不改代码调：`--rw clock=0.5,alive=0.1`；可用项见 `env.py` 顶部 `REWARD`。
 - 左右镜像约束：`train.py --sym 4`（见"设计要点"）。新加观测块要在 `env.HumanoidEnv._mirror_block` 写它的镜像，否则开了 `--sym` 会报错。
 - 动作边界损失 `--bound 1`：动作均值超出"PD 目标角不被关节限位裁掉"的范围就罚（见"设计要点"）。
@@ -52,6 +54,7 @@ viewer.bat                                                              # 起本
 | `ppo.py` | PPO |
 | `train.py` | 训练入口 |
 | `export.py` | 载入策略，跑几个人形，导出每帧每个刚体的位置和朝向 |
+| `export_timeline.py` | 一条训练链的所有快照导出成时间线（`web/replays/tl_<名>/`），同一段的快照放进同一个环境并行跑 |
 | `policy.py` | `load_policy`：载入策略文件，按它自己存的环境设置（身体、观测块、指令范围……）建环境。回放和测验都用它 |
 | `eval_policy.py` | 每个人形给固定指令，从真实接触量实际步频、着地比例、速度 |
 | `regress.py` | 回归测验：速度/转向跟踪、步态指令网格、姿态（对照真人范围）、20 秒随机换指令的摔倒数；`--save` 存 `regress.json`，`--baseline` 和基线比，标出退步项 |
@@ -324,6 +327,9 @@ viewer.bat                                                              # 起本
 - 下一步候选：① 修着地比例（例如 `knee_swing` 目标随摆动窗口长短缩放，或者只在脚真的离地时要求屈膝）；② 用户看过回放同意后，底座换成 knee3，再练侧移。
 
 ## 回放页面
+- **时间线**（2026-10-16 加）：列表里标"轮数可拖"的是时间线。选中后底部多一条"轮数"滑块，◀ ▶ 或 ↑/↓ 一次走一个快照。换轮数时人形不重建、时间点不变，可以暂停在某一刻，拖轮数看同一个动作是怎么练出来的。和普通回放一起勾选可以同台对比；勾了两条时间线时，第二条取轮数最接近的快照。
+  - `tl_knee3`：sym1 → sym2 → stand1～3 → knee2 → knee3，第 50～4200 轮共 84 个快照（每 50 轮一个），每个快照 3 个人形、0.5 MB，共 36 MB，导出 75 秒。早期的快照没练过站定和倒退，走到那一段会摔。
+  - 文件：`manifest.json`（刚体、几何体、每个快照的轮数、所属的段、每个人形的帧数和是否摔倒）+ 每个快照一个 `it_XXXXX.bin`。`.bin` 是小端二进制，按人形依次放位置 int16（毫米）、朝向 int16（×32767）、前进速度 int16（毫米/秒）、两脚接触 uint8。页面打开后在后台把所有快照下载好，拖滑块不用等。
 - 底部工具栏："特写"对准第一个人，"全景"回默认镜头，空格暂停。默认打开最近一次导出的回放，勾选多个可同台对比（每组一段跑道）。
 - **造型定型，没有调节面板**。外观参数集中在 `web/index.html` 的 `LOOK`（头、脖子、肩、胸腰胯、四肢粗细、袖长、手脚大小、描边、肤色/头发/裤子/鞋颜色），改完刷新生效。会改变物理的东西（质量、力气、关节范围、默认姿势）在 `make_model.py` 的预设和 `models/arm_pose.json`，改了必须重训；身体比例在 `models/humanoid.xml`，改了还要同步改网页造型。
 - 外观（`dressCharacter`）只影响画面，物理和训练用官方胶囊体：
@@ -351,6 +357,8 @@ viewer.bat                                                              # 起本
 
 ## 路线图（2026-10-14）
 最终目标：跑酷躲障碍、拳击、躲避球。底层先练成通才再冻结，任务都做成它上面的一层（高层只下指令），训练快、底层不退步。
+
+**近期目标（2026-10-16 定）：网页里能直接玩的人偶**。打开网页，用鼠标推它、扔球砸它、拖指令让它走，它会踉跄、站稳、躲开。物理用 MuJoCo 官方的 WebAssembly 版（和训练是同一个引擎），策略网络在浏览器里算。远期目标太远、用处不直观，先做一个做完就能玩的成品。顺序：修好着地比例 → 被推不倒 → 摔倒后起身 → 网页互动版 → 加发球机（躲避球的雏形）。
 
 0. **基础**（2026-10-14 完成）
    - ✅ 身体 `human50`（见"身体模型"），含脖子；身体模型存进策略文件。

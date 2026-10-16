@@ -13,14 +13,10 @@ ENV_KEYS = ("xml", "obs", "ep_len", "action_frac", "reward", "arm_pose", "arm_sw
             "cmd_freq", "cmd_duty", "cmd_stand", "cmd_acc", "cmd_period")
 
 
-def load_policy(path, nworld, **overrides):
-    """返回 (环境, 确定性动作函数 obs -> action, {iteration, env: 实际用的环境设置})。
-    overrides 覆盖策略自带的环境设置(例如固定的指令、ep_len)。"""
-    s = torch.load(path, map_location="cuda:0", weights_only=False)
-    cfg = {k: v for k, v in s["env"].items() if k in ENV_KEYS}
-    cfg.setdefault("obs", list(DEFAULT_OBS))
-    cfg.update(overrides)
-    env = HumanoidEnv(nworld, **cfg)
+def load_actor(s, env):
+    """策略文件(路径或已载入的 dict)里的演员网络和观测归一化, 接到已经建好的环境上。返回确定性动作函数 obs -> action。"""
+    if isinstance(s, str):
+        s = torch.load(s, map_location="cuda:0", weights_only=False)
     assert [tuple(b) for b in s.get("obs_layout", env.obs_layout)] == env.obs_layout, "策略的观测布局和环境不一致"
     actor = mlp(env.obs_dim, env.nu, s["hidden"], 0.01).to(env.dev)
     actor.load_state_dict(s["actor"])
@@ -31,4 +27,21 @@ def load_policy(path, nworld, **overrides):
     def act(obs):
         return actor(rms.norm(obs))
 
-    return env, act, dict(iteration=int(s["iteration"]), env=cfg)
+    return act
+
+
+def env_config(s, **overrides):
+    """策略文件里存的环境设置(只取 HumanoidEnv 认的键), 加上覆盖项"""
+    cfg = {k: v for k, v in s["env"].items() if k in ENV_KEYS}
+    cfg.setdefault("obs", list(DEFAULT_OBS))
+    cfg.update(overrides)
+    return cfg
+
+
+def load_policy(path, nworld, **overrides):
+    """返回 (环境, 确定性动作函数 obs -> action, {iteration, env: 实际用的环境设置})。
+    overrides 覆盖策略自带的环境设置(例如固定的指令、ep_len)。"""
+    s = torch.load(path, map_location="cuda:0", weights_only=False)
+    cfg = env_config(s, **overrides)
+    env = HumanoidEnv(nworld, **cfg)
+    return env, load_actor(s, env), dict(iteration=int(s["iteration"]), env=cfg)
