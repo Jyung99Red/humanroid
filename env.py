@@ -50,10 +50,14 @@ REWARD = dict(
     foot_flat=0.0,     # 罚着地时脚尖翘着(heel_down 只罚朝下): 着地前 20% 脚跟着地, 脚尖最多翘 LAND_TOE_UP; 20%~70% 脚踩平, 脚尖不许翘。例如 6.0
     heel_strike=0.0,   # 每次着地的前 15% 脚踩着地时脚尖翘起(脚跟先着地)给奖励, 翘到 15° 封顶(每只脚最多 1); 和 toe_off 对称。例如 0.5
     foot_clear=0.0,    # 步态时钟说该摆动的脚, 离地高度要跟上 FOOT_CLEAR_H * sin(pi * 摆动进度), 低了就罚。例如 1.0
+    knee_swing=0.0,    # 步态时钟说该摆动的腿, 屈膝要跟上 KNEE_SWING_DEG * sin(pi * 摆动进度), 弯得不够就罚。例如 2.0
+    knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
 FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原点平放时离地 0.027)。真人摆到中途脚底只离地几厘米; 定成 10 cm 会逼出踮脚走
 LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
+KNEE_SWING_DEG = 40.0     # 度, 摆腿中途膝盖弯多少(真人走路约 60°, 慢走、侧移小一些)
+KNEE_MIN_DEG = 5.0        # 度, 膝盖至少弯这么多(真人着地期约 5~20°, 站着约 0~5°)
 TRACK_FINE = 0.05         # 窄跟踪项的误差尺度: exp(-误差^2 / 0.05), 即 sigma 约 0.22(宽的那两项是 0.25, sigma 0.5)
 WALK_V = 0.3              # m/s, 前进(倒退)指令到这个速度, 脚的姿态规则完全按往前走(倒退)算; 速度指令为 0 时按站定算
 
@@ -199,6 +203,7 @@ class HumanoidEnv:
         self.neck_z_adr = int(mjm.jnt_qposadr[nz]) if nz >= 0 else None
         self.pelvis_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
         self.waist_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("abdomen_x", "abdomen_z")]
+        self.knee_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("knee_right", "knee_left")]
         self.root_z0 = float(mjm.qpos0[2]) + 0.02
 
         wp.set_device("cuda:0")
@@ -474,6 +479,16 @@ class HumanoidEnv:
             target = FOOT_CLEAR_H * torch.sin(math.pi * prog)
             short = (target - (self.xpos[:, self.foot_ids, 2] - 0.027)).clamp(min=0) / FOOT_CLEAR_H
             r = r - rw["foot_clear"] * (short ** 2).sum(dim=1)
+        if rw["knee_swing"] or rw["knee_lock"]:            # 膝关节角为负是弯, 屈膝角 = -角度; 右、左两条腿和 foot_ids 同序
+            flex = -self.qpos[:, self.knee_adr]
+            if rw["knee_swing"]:                           # 和 foot_clear 同一个摆动进度; 只罚弯得不够, 站定(D = 1)没有摆动期
+                ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
+                D = self.gait[:, 1:2]
+                prog = ((ph - D) / (1 - D).clamp(min=1e-3)).clamp(0, 1) * (ph >= D)
+                want = math.radians(KNEE_SWING_DEG) * torch.sin(math.pi * prog)
+                r = r - rw["knee_swing"] * (((want - flex).clamp(min=0) / math.radians(KNEE_SWING_DEG)) ** 2).sum(dim=1)
+            if rw["knee_lock"]:
+                r = r - rw["knee_lock"] * (((math.radians(KNEE_MIN_DEG) - flex).clamp(min=0) / math.radians(KNEE_MIN_DEG)).clamp(max=1) ** 2).sum(dim=1)
         if rw["head_level"] and self.neck_z_adr is not None:   # 头的倾斜(重力在头坐标系里的水平分量) + 脖子左右转的角度
             gh = quat_to_gravity(self.xquat[:, self.head_id])
             r = r - rw["head_level"] * ((gh[:, :2] ** 2).sum(dim=1) + self.qpos[:, self.neck_z_adr] ** 2)

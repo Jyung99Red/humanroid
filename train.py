@@ -46,6 +46,7 @@ p.add_argument("--priv-add", type=str, default="", help="只给评论家加的�
 p.add_argument("--save-every", type=int, default=10)
 p.add_argument("--snap-every", type=int, default=50)
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
 
@@ -72,7 +73,7 @@ env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy)
                cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
-ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym)
+ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound)
 if ck is not None:
     ppo.load(ck)
     print(f"从 {a.resume} 接着练, 已有 {ppo.iteration} 轮")
@@ -111,7 +112,8 @@ for _ in range(a.iters):
     print(f"it {m['it']:4d} | {sps/1e3:5.0f}k步/s (采{m['t_collect']:.2f}s 训{m['t_update']:.2f}s) | 每步奖励 {m['rew']:6.3f} | "
           f"回合长 {m['ep_len']:6.1f} | 回合回报 {m['ep_ret']:7.1f} | 摔倒 {m['fall']*100:5.2f}%/步 | "
           f"vx {m['vx']:5.2f} 误差 {m['lin_err']:5.3f} | KL {m['kl']:.4f} lr {m['lr']:.1e} std {m['std']:.3f} | "
-          f"vloss {m['vloss']:.3f} clip {m['clipfrac']:.2f}" + (f" | 不对称 {m['sym']:.4f}" if "sym" in m else ""), flush=True)
+          f"vloss {m['vloss']:.3f} clip {m['clipfrac']:.2f}" + (f" | 不对称 {m['sym']:.4f}" if "sym" in m else "")
+          + (f" | 越界 {m['bound']:.3f}" if "bound" in m else ""), flush=True)
     if m["it"] % a.save_every == 0:
         save(os.path.join(a.out, "ckpt.pt"))
         save_policy(os.path.join(a.out, "policy.pt"))

@@ -8,6 +8,8 @@
 - 观测可以扩展: 检查点记着观测块布局, 续训时环境多了新块, 第一层给新块补零列(优化器动量、归一化统计一起补), 已有行为不变。
 - 左右镜像约束(sym > 0): 演员多一项损失 sym x |策略(镜像观测) - 镜像(策略(观测))|^2, 评论家把镜像观测也学成同一个回报;
   探索噪声的标准差左右取平均。身体、奖励左右对称时, 最优策略本来就该对称, 不加约束的话两条腿会各学各的(style_trial6 右脚脚跟走、左脚前脚掌)。
+- 动作边界损失(bound > 0): 动作均值超出"PD 目标角不被关节限位裁掉"的范围时, 加 bound x 超出量^2。超出后动作怎么变目标角都一样,
+  PPO 拿不到梯度, 策略会一直卡在限位外(human50 策略的膝盖动作均值约 +3, 而 +0.04 以上目标角就都是伸直限位 +2°)。
 """
 import math
 import time
@@ -97,9 +99,12 @@ class ActorCritic(nn.Module):
 
 class PPO:
     def __init__(self, env, T=24, epochs=5, minibatches=4, lr=1e-3, critic_lr=5e-4, clip=0.2, ent=0.005,
-                 gamma=0.99, lam=0.95, kl_target=0.01, init_std=0.5, hidden=(512, 256, 128), max_grad=1.0, sym=0.0):
+                 gamma=0.99, lam=0.95, kl_target=0.01, init_std=0.5, hidden=(512, 256, 128), max_grad=1.0, sym=0.0, bound=0.0):
         self.env, self.dev = env, env.dev
-        self.sym = sym
+        self.sym, self.bound = sym, bound
+        # 每个关节"目标角不被限位裁掉"的动作范围(再和动作裁剪取交集)
+        self.a_lo = ((env.lo - env.q_def) / env.scale).clamp(-env.act_clip, env.act_clip)
+        self.a_hi = ((env.hi - env.q_def) / env.scale).clamp(-env.act_clip, env.act_clip)
         self.T, self.epochs, self.mb, self.clip, self.ent = T, epochs, minibatches, clip, ent
         self.gamma, self.lam, self.kl_target, self.max_grad, self.lr = gamma, lam, kl_target, max_grad, lr
         self.ac = ActorCritic(env.obs_dim, env.critic_dim, env.nu, hidden, init_std).to(self.dev)
@@ -202,7 +207,7 @@ class PPO:
         if not self.ret_init:                               # 第一轮: 先用这批回报定好归一化(输出层同步缩放, 价值不变)
             self._update_ret_stats(flat["ret"])
         ret_n = (flat["ret"] - self.ret_mean) / self.ret_std
-        stats = dict(kl=0.0, vloss=0.0, ploss=0.0, clipfrac=0.0, k=0, **({"sym": 0.0} if self.sym else {}))
+        stats = dict(kl=0.0, vloss=0.0, ploss=0.0, clipfrac=0.0, k=0, **({"sym": 0.0} if self.sym else {}), **({"bound": 0.0} if self.bound else {}))
         last_kl, stop = 0.0, False
         for _ in range(self.epochs):
             perm = torch.randperm(n, device=self.dev)
@@ -225,6 +230,9 @@ class PPO:
                     sym_err = ((self.ac.actor(flat["obs_m"][chunk]) - env.mirror(mu, env.act_mirror)) ** 2).sum(-1).mean()
                     v_m = self.ac.critic(flat["cobs_m"][chunk]).squeeze(-1)
                     loss = loss + self.sym * sym_err + 0.5 * ((v_m - ret_n[chunk]) ** 2).mean()
+                if self.bound:
+                    bound_err = ((mu - self.a_hi).clamp(min=0) ** 2 + (self.a_lo - mu).clamp(min=0) ** 2).sum(-1).mean()
+                    loss = loss + self.bound * bound_err
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.actor_params, self.max_grad)
@@ -247,6 +255,8 @@ class PPO:
                     stats["k"] += 1
                     if self.sym:
                         stats["sym"] += sym_err.item()
+                    if self.bound:
+                        stats["bound"] += bound_err.item()
                 if kl > 3 * self.kl_target:                # 这一轮策略已经动得够多了, 提前收手
                     stop = True
                     break

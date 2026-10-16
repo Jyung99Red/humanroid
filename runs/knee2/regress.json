@@ -1,0 +1,26 @@
+{
+ "policy": "runs/knee2/policy.pt",
+ "iteration": 3600,
+ "metrics": {
+  "vx_err": 0.07095618247985835,
+  "wz_err": 0.05634026527404784,
+  "freq_err": 0.83334732055663,
+  "duty_err": 0.12027777433395381,
+  "track_fall": 0,
+  "back_err": 0.0832186698913574,
+  "stand_move": 7.11423417669721e-05,
+  "stand_steps": 0.0,
+  "pelvis_roll": 5.180233992103488,
+  "pelvis_yaw": 7.112769521106966,
+  "width_cm": 8.94763469696045,
+  "head_pitch": 1.507227643936872,
+  "clear_cm": 10.596269607543945,
+  "land_toe_up": 21.67868995666504,
+  "push_off": 31.62177276611328,
+  "slip_cms": 8.966082771169551,
+  "foot_lr_diff": 0.24699819087982178,
+  "knee_swing": 31.99653434753418,
+  "knee_stance": 1.0471783876419067,
+  "random_fall": 0
+ }
+}

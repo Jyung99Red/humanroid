@@ -38,6 +38,8 @@ METRICS = {
     "width_cm": ("落地时两脚左右间距 cm", "range", 1.0, (8, 12)),
     "head_pitch": ("头俯仰晃动 ±°", "range", 1.0, (0, 4)),
     "clear_cm": ("抬脚高度 cm", "info", 0, None),
+    "knee_swing": ("摆腿时屈膝(每条腿 95 分位) °", "range", 3.0, (45, 70)),
+    "knee_stance": ("着地时屈膝(平均) °", "range", 2.0, (5, 20)),
     "land_toe_up": ("落地瞬间脚尖朝上 °(脚跟先着地)", "info", 0, None),
     "push_off": ("支撑末段脚尖朝下 °(蹬地)", "info", 0, None),
     "foot_lr_diff": ("左右脚俯仰差 °", "err", 3.0, None),
@@ -111,9 +113,11 @@ def run_pose(env, act, K=32, seconds=10.0):
     env.set_cmd(cmd, gt)
     T = int(seconds / env.dt)
     xp, xq, con = (torch.zeros(T, K, *shape, device=env.dev) for shape in ((env.xpos.shape[1], 3), (env.xpos.shape[1], 4), (2,)))
+    knee = torch.zeros(T, K, 2, device=env.dev)              # 屈膝角(度, 右、左), 关节角为负是弯
     fell = torch.zeros(env.n, dtype=torch.bool, device=env.dev)
     for t in range(T):
         xp[t], xq[t], con[t] = env.xpos[:K], env.xquat[:K], env.contact[:K]
+        knee[t] = -env.qpos[:K, env.knee_adr].rad2deg()
         obs, _ = env.observe()
         _, _, _, te, _, _ = env.step(act(obs))
         fell |= te
@@ -122,8 +126,13 @@ def run_pose(env, act, K=32, seconds=10.0):
     keep = [k for k in range(K) if not fell[k]]
     xp, xq, con = xp.cpu().numpy(), xq.cpu().numpy(), con.cpu().numpy()
     st = gait_stats([(xp[:, k], xq[:, k], con[:, k]) for k in keep], names, env.dt)
-    return {k: float(st[k]) for k in ("pelvis_roll", "pelvis_yaw", "width_cm", "head_pitch", "clear_cm", "land_toe_up", "push_off", "slip_cms",
-                                         "foot_lr_diff")}
+    out = {k: float(st[k]) for k in ("pelvis_roll", "pelvis_yaw", "width_cm", "head_pitch", "clear_cm", "land_toe_up", "push_off", "slip_cms",
+                                        "foot_lr_diff")}
+    w = int(2.0 / env.dt)                                     # 跳过开头 2 秒
+    kn, on = knee[w:, keep].cpu().numpy(), con[w:, keep] > 0
+    out["knee_swing"] = float(np.percentile(kn, 95, axis=0).mean())
+    out["knee_stance"] = float(kn[on].mean())
+    return out
 
 
 @torch.no_grad()
