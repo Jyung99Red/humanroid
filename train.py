@@ -6,6 +6,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import time
 
@@ -46,6 +47,8 @@ p.add_argument("--priv-add", type=str, default="", help="只给评论家加的�
 p.add_argument("--save-every", type=int, default=10)
 p.add_argument("--snap-every", type=int, default=50, help="每多少轮存一个快照到 snaps/(每个约 330 KB, 导出成时间线约 0.5 MB); 回放时间线按快照逐个看")
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--std", type=float, default=0.0, help="续训时把探索噪声的标准差重置成这个值(例如 0.3); 0 = 沿用检查点的。"
+               "std 塌到 0.15 左右时, 学习率按 KL 自动调会被压到下限, 策略几乎学不动新东西")
 p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
@@ -77,6 +80,10 @@ ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.cr
 if ck is not None:
     ppo.load(ck)
     print(f"从 {a.resume} 接着练, 已有 {ppo.iteration} 轮")
+    if a.std:
+        with torch.no_grad():
+            print(f"探索噪声 std {ppo.ac.std().mean().item():.3f} -> {a.std}")
+            ppo.ac.log_std.fill_(math.log(a.std))
 
 json.dump(dict(vars(a), env=env_cfg), open(os.path.join(a.out, "config.json"), "w"), ensure_ascii=False, indent=1)
 print(f"{a.envs} 个环境 x {a.T} 步 = 每轮 {a.envs * a.T} 个样本; 观测 {env.obs_dim}(评论家 {env.critic_dim}), 动作 {env.nu}; 输出目录 {a.out}")

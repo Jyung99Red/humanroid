@@ -41,6 +41,7 @@ with torch.no_grad():
     env.gait[1] = env.gait[0]
     env.action[1], env.prev_action[1] = env.mirror(env.action[0], A), env.mirror(env.prev_action[0], A)
     env.contact[1] = env.contact[0].flip(0)
+    env.air[1] = env.air[0].flip(0)
     env.cmd_goal[1], env.gait_goal[1] = env.cmd[1], env.gait[1]
     env.t[1], env.cmd_t[1] = env.t[0], env.cmd_t[0]
     flip = torch.tensor([1.0, -1.0], device=env.dev)

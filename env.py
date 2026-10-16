@@ -51,6 +51,8 @@ REWARD = dict(
     heel_strike=0.0,   # 每次着地的前 15% 脚踩着地时脚尖翘起(脚跟先着地)给奖励, 翘到 15° 封顶(每只脚最多 1); 和 toe_off 对称。例如 0.5
     foot_clear=0.0,    # 步态时钟说该摆动的脚, 离地高度要跟上 FOOT_CLEAR_H * sin(pi * 摆动进度), 低了就罚。例如 1.0
     knee_swing=0.0,    # 步态时钟说该摆动的腿, 屈膝要跟上 KNEE_SWING_DEG * sin(pi * 摆动进度), 弯得不够就罚。例如 2.0
+    knee_air=0.0,      # 同 knee_swing, 但摆动进度从脚真正离地算起(离地时间 / 指令的摆动时长): 不管什么时候抬脚要求都一样, 抬脚时机只由 clock 管。
+                       # knee_swing 按时钟算, 着地比例大时摆动窗口短, 等于奖励提前抬脚(knee3 不管指令多少都在时钟 0.6 抬脚)。例如 2.0
     knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
@@ -214,6 +216,7 @@ class HumanoidEnv:
         self.ctrl, self.warm = wp.to_torch(self.d.ctrl), wp.to_torch(self.d.qacc_warmstart)
         self.xpos, self.frc = wp.to_torch(self.d.xpos), wp.to_torch(self.d.qfrc_actuator)
         self.xquat = wp.to_torch(self.d.xquat)
+        self.air = torch.zeros(nworld, 2, device=self.dev)            # 两只脚各自离地了多久(秒), 着地时为 0
         self.foot_prev = torch.zeros(nworld, 2, 2, device=self.dev)     # 上一步两只脚的水平位置, 用来算打滑的速度
         self.point_prev = torch.zeros(nworld, 2, 2, 3, device=self.dev)  # 上一步两只脚的脚跟、脚尖点位置 [世界, 脚, 点, xyz]
         self.foot_pts = [torch.tensor(p, device=self.dev).expand(nworld, 3) for p in FOOT_POINTS]
@@ -283,6 +286,7 @@ class HumanoidEnv:
         self.action[idx] = 0
         self.prev_action[idx] = 0
         self.contact[idx] = 1
+        self.air[idx] = 0
         self.phase[idx] = torch.rand(k, **f)
         if not fresh:
             self.t[idx] = 0
@@ -396,6 +400,7 @@ class HumanoidEnv:
         # 摔倒(脚以外碰地)和两只脚是否着地, 都来自真实接触点(以前用"脚踝高度 < 5.5 cm"估算, 和真实接触只有 71% 一致)
         fell, feet = self.ground_contact()
         self.contact = feet.float()
+        self.air = torch.where(feet, torch.zeros_like(self.air), self.air + self.dt)
 
         # 在"朝向对齐"的水平坐标系里比较速度, 这样躯干前倾也不会影响速度跟踪
         w, x, y, zq = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -479,7 +484,7 @@ class HumanoidEnv:
             target = FOOT_CLEAR_H * torch.sin(math.pi * prog)
             short = (target - (self.xpos[:, self.foot_ids, 2] - 0.027)).clamp(min=0) / FOOT_CLEAR_H
             r = r - rw["foot_clear"] * (short ** 2).sum(dim=1)
-        if rw["knee_swing"] or rw["knee_lock"]:            # 膝关节角为负是弯, 屈膝角 = -角度; 右、左两条腿和 foot_ids 同序
+        if rw["knee_swing"] or rw["knee_lock"] or rw["knee_air"]:            # 膝关节角为负是弯, 屈膝角 = -角度; 右、左两条腿和 foot_ids 同序
             flex = -self.qpos[:, self.knee_adr]
             if rw["knee_swing"]:                           # 和 foot_clear 同一个摆动进度; 只罚弯得不够, 站定(D = 1)没有摆动期
                 ph = torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0
@@ -487,6 +492,10 @@ class HumanoidEnv:
                 prog = ((ph - D) / (1 - D).clamp(min=1e-3)).clamp(0, 1) * (ph >= D)
                 want = math.radians(KNEE_SWING_DEG) * torch.sin(math.pi * prog)
                 r = r - rw["knee_swing"] * (((want - flex).clamp(min=0) / math.radians(KNEE_SWING_DEG)) ** 2).sum(dim=1)
+            if rw["knee_air"]:                             # 指令的摆动时长 = (1 - 着地比例) / 步频; 落地晚了(进度超过 1)目标为 0
+                t_sw = ((1 - self.gait[:, 1:2]) / self.gait[:, :1]).clamp(min=self.dt)
+                want = math.radians(KNEE_SWING_DEG) * torch.sin(math.pi * (self.air / t_sw).clamp(max=1))
+                r = r - rw["knee_air"] * (((want - flex).clamp(min=0) / math.radians(KNEE_SWING_DEG)) ** 2).sum(dim=1)
             if rw["knee_lock"]:
                 r = r - rw["knee_lock"] * (((math.radians(KNEE_MIN_DEG) - flex).clamp(min=0) / math.radians(KNEE_MIN_DEG)).clamp(max=1) ** 2).sum(dim=1)
         if rw["head_level"] and self.neck_z_adr is not None:   # 头的倾斜(重力在头坐标系里的水平分量) + 脖子左右转的角度
