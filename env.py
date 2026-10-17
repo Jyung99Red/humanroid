@@ -53,6 +53,8 @@ REWARD = dict(
     knee_swing=0.0,    # 步态时钟说该摆动的腿, 屈膝要跟上 KNEE_SWING_DEG * sin(pi * 摆动进度), 弯得不够就罚。例如 2.0
     knee_air=0.0,      # 同 knee_swing, 但摆动进度从脚真正离地算起(离地时间 / 指令的摆动时长): 不管什么时候抬脚要求都一样, 抬脚时机只由 clock 管。
                        # knee_swing 按时钟算, 着地比例大时摆动窗口短, 等于奖励提前抬脚(knee3 不管指令多少都在时钟 0.6 抬脚)。例如 2.0
+    stand_feet=0.0,    # 指令是站定(着地比例 1)、又不在被推后 PUSH_GRACE 秒内时, 哪只脚离地罚哪只(两只都离地罚满 1)。
+                       # 开了随机推搡后策略学会"一直原地踏步"(随时准备跨步, 不容易被推倒), clock 压不住。例如 2.0
     knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
@@ -60,6 +62,7 @@ FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原�
 LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
 KNEE_SWING_DEG = 40.0     # 度, 摆腿中途膝盖弯多少(真人走路约 60°, 慢走、侧移小一些)
 KNEE_MIN_DEG = 5.0        # 度, 膝盖至少弯这么多(真人着地期约 5~20°, 站着约 0~5°)
+PUSH_GRACE = 1.0          # 秒, 被推之后多久内不按步态时钟奖励节奏
 TRACK_FINE = 0.05         # 窄跟踪项的误差尺度: exp(-误差^2 / 0.05), 即 sigma 约 0.22(宽的那两项是 0.25, sigma 0.5)
 WALK_V = 0.3              # m/s, 前进(倒退)指令到这个速度, 脚的姿态规则完全按往前走(倒退)算; 速度指令为 0 时按站定算
 
@@ -140,7 +143,7 @@ def mirror_joints(mjm, jid, names):
 OBS_BLOCKS = dict(
     gravity="重力方向(机体系)", lin_vel="线速度(机体系, x2)", ang_vel="角速度(机体系, x0.25)", joint_pos="关节角",
     joint_vel="关节速度(x0.05)", last_action="上一步动作", cmd="速度指令 vx,vy,wz", clock="步态时钟 sin/cos", gait="步态指令 步频,着地比例",
-    height="躯干高度", foot_contact="两只脚是否着地",
+    height="躯干高度", foot_contact="两只脚是否着地", push="正在推躯干的力(机体系, /100 N; 只给评论家用)",
 )
 DEFAULT_OBS = ("gravity", "lin_vel", "ang_vel", "joint_pos", "joint_vel", "last_action", "cmd", "clock")
 DEFAULT_PRIV = ("height", "foot_contact")          # 只给评论家(训练时的特权信息)
@@ -150,7 +153,8 @@ class HumanoidEnv:
     def __init__(self, nworld, xml="models/humanoid_pd.xml", decimation=4, ep_len=500, action_frac=0.3,
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
-                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None):
+                 arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None,
+                 push_force=0.0, push_period=(100, 250), push_len=10):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -158,6 +162,8 @@ class HumanoidEnv:
         self.dec, self.ep_len, self.act_clip = decimation, ep_len, act_clip
         self.cmd_period, self.random_yaw = cmd_period, random_yaw   # 多少步换一次指令: 一个数, 或 (lo, hi) 每次在里面随机抽
         self.cmd_rng = (cmd_vx, cmd_vy, cmd_wz)
+        # 随机推搡: 每隔 push_period(步数, 每次随机抽)给躯干一个水平力, 持续 push_len 步, 方向随机, 大小在 0~push_force(牛)里均匀抽
+        self.push_force, self.push_period, self.push_len = push_force, push_period, push_len
         # 步态指令的范围; 没给步频就用固定的 1 / gait_period(旧配置只有 gait_period)
         self.gait_rng = (cmd_freq or (1.0 / gait_period, 1.0 / gait_period), cmd_duty)
         self.stand_prob = cmd_stand                       # 抽指令时有这么大概率是"站定": 速度全 0、着地比例 1
@@ -216,6 +222,12 @@ class HumanoidEnv:
         self.ctrl, self.warm = wp.to_torch(self.d.ctrl), wp.to_torch(self.d.qacc_warmstart)
         self.xpos, self.frc = wp.to_torch(self.d.xpos), wp.to_torch(self.d.qfrc_actuator)
         self.xquat = wp.to_torch(self.d.xquat)
+        self.xfrc = wp.to_torch(self.d.xfrc_applied)                  # [世界, 刚体, 力 xyz + 力矩 xyz](世界系, 作用在刚体质心)
+        self.torso_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        self.push_f = torch.zeros(nworld, 2, device=self.dev)          # 当前的推力(世界系 xy, 牛)
+        self.push_left = torch.zeros(nworld, dtype=torch.long, device=self.dev)   # 这次推还剩几步
+        self.push_next = torch.zeros(nworld, dtype=torch.long, device=self.dev)   # 离下次推还有几步
+        self.since_push = torch.full((nworld,), 10 ** 6, dtype=torch.long, device=self.dev)   # 上次推开始以来过了几步
         self.air = torch.zeros(nworld, 2, device=self.dev)            # 两只脚各自离地了多久(秒), 着地时为 0
         self.foot_prev = torch.zeros(nworld, 2, 2, device=self.dev)     # 上一步两只脚的水平位置, 用来算打滑的速度
         self.point_prev = torch.zeros(nworld, 2, 2, 3, device=self.dev)  # 上一步两只脚的脚跟、脚尖点位置 [世界, 脚, 点, xyz]
@@ -288,6 +300,8 @@ class HumanoidEnv:
         self.contact[idx] = 1
         self.air[idx] = 0
         self.phase[idx] = torch.rand(k, **f)
+        self.push_f[idx], self.push_left[idx], self.since_push[idx] = 0, 0, 10 ** 6
+        self.push_next[idx] = self._push_gap(k)
         if not fresh:
             self.t[idx] = 0
 
@@ -306,6 +320,14 @@ class HumanoidEnv:
         p = self.cmd_period
         self.cmd_due[idx] = p if isinstance(p, int) else torch.randint(p[0], p[1] + 1, (k,), device=self.dev)
         self.cmd_t[idx] = 0
+
+    def _push_gap(self, k):
+        p = self.push_period
+        return torch.randint(p[0], p[1] + 1, (k,), device=self.dev)
+
+    def push(self, idx, force_xy):
+        """从现在起推 idx 这些世界 push_len 步。force_xy [k, 2] 世界系(牛)。测验、网页互动也用它。"""
+        self.push_f[idx], self.push_left[idx], self.since_push[idx] = force_xy, self.push_len, 0
 
     def set_cmd(self, cmd, gait=None):
         """测验、回放直接定指令(立即生效, 不走加速度限制): 实际指令和目标一起改。cmd [n,3] 或 [3], gait [n,2] 或 [2]。"""
@@ -337,6 +359,7 @@ class HumanoidEnv:
             gait=lambda: self.gait,
             height=lambda: self.qpos[:, 2:3],
             foot_contact=lambda: self.contact,
+            push=lambda: rotate_inverse(q, torch.cat([self.push_f * (self.push_left > 0)[:, None], torch.zeros_like(self.push_f[:, :1])], 1)) / 100,
         )
 
     def _mirror_block(self, name):
@@ -345,7 +368,8 @@ class HumanoidEnv:
         jp, js = self.mirror_perm, self.mirror_sign
         table = dict(gravity=([0, 1, 2], [1, -1, 1]), lin_vel=([0, 1, 2], [1, -1, 1]), ang_vel=([0, 1, 2], [-1, 1, -1]),
                      joint_pos=(jp, js), joint_vel=(jp, js), last_action=(jp, js), cmd=([0, 1, 2], [1, -1, -1]), clock=([0, 1], [-1, -1]),
-                     gait=([0, 1], [1, 1]), height=([0], [1]), foot_contact=([1, 0], [1, 1]))
+                     gait=([0, 1], [1, 1]), height=([0], [1]), foot_contact=([1, 0], [1, 1]),
+                     push=([0, 1, 2], [1, -1, 1]))
         assert name in table, f"观测块 {name} 没写左右镜像(_mirror_block)"
         return table[name]
 
@@ -389,7 +413,19 @@ class HumanoidEnv:
         self.prev_action.copy_(self.action)
         self.action = action.clamp(-self.act_clip, self.act_clip)
         self.ctrl[:] = (self.q_def + self.action * self.scale).clamp(self.lo, self.hi)
+        if self.push_force > 0:                            # 到点的世界开始一次随机推
+            due = (self.push_next <= 0) & (self.push_left <= 0)
+            idx = due.nonzero(as_tuple=False).squeeze(1)
+            if idx.numel():
+                ang = torch.rand(idx.numel(), device=self.dev) * 2 * math.pi
+                mag = torch.rand(idx.numel(), device=self.dev) * self.push_force
+                self.push(idx, torch.stack([torch.cos(ang), torch.sin(ang)], 1) * mag[:, None])
+                self.push_next[idx] = self._push_gap(idx.numel())
+            self.push_next -= 1
+        self.xfrc[:, self.torso_id, :2] = self.push_f * (self.push_left > 0)[:, None]
         wp.capture_launch(self.graph)
+        self.push_left = (self.push_left - 1).clamp(min=0)
+        self.since_push += 1
 
         self.t += 1
         self.cmd_t += 1
@@ -421,7 +457,12 @@ class HumanoidEnv:
         r = r + rw["alive"]
         # 步态时钟: 右脚在 [0, D) 该踩地, 左脚晚半个周期; D = 0.5 就是左右严格轮换, D = 1 两脚都该踩地(站)
         want = (torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0 < self.gait[:, 1:2]).float()
-        r = r + rw["clock"] * (self.contact == want).float().mean(dim=1)
+        # 被推之后 PUSH_GRACE 秒内不管节奏: 要乱跨几步才稳得住(站着被推也一样)
+        grace = (self.since_push.float() * self.dt < PUSH_GRACE).float()
+        r = r + rw["clock"] * (1 - grace) * (self.contact == want).float().mean(dim=1)
+        if rw["stand_feet"]:
+            standing = (self.gait[:, 1] > 0.99).float() * (1 - grace)
+            r = r - rw["stand_feet"] * standing * (1 - self.contact).mean(dim=1)
         r = r - rw["upright"] * (g[:, :2] ** 2).sum(dim=1)
         r = r - rw["action_rate"] * ((self.action - self.prev_action) ** 2).sum(dim=1)
         power = (self.frc[:, self.dadr] * self.qvel[:, self.dadr]).abs().sum(dim=1)

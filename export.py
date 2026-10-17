@@ -7,6 +7,7 @@
 策略用确定性动作(均值), 不加探索噪声。每个世界只记录到第一次摔倒/超时为止。
 坐标是 MuJoCo 原样(Z 轴朝上, 四元数 wxyz), 转成 three.js 的朝向由网页负责。
 推演和模型信息的函数(parse_seq / fixed_cmd / rollout / model_info / kinematics)也给 export_timeline.py 用。
+--push "秒:fx,fy; ..." 在这些时刻推躯干(世界系, 牛; x 朝前, y 朝左), 每次 0.2 秒, 网页上画红色箭头。
 """
 import argparse
 import json
@@ -35,9 +36,10 @@ def fixed_cmd(seq, cmd="1.0,0,0", gait=""):
 
 
 @torch.no_grad()
-def rollout(env, act, steps, seq, wz0, gait_fixed, hold_heading=1.5):
+def rollout(env, act, steps, seq, wz0, gait_fixed, hold_heading=1.5, pushes=()):
     """所有世界一起从头跑 steps 步。返回 numpy 的 (q_hist [T,N,nq], vx_hist [T,N], c_hist [T,N,2], end [N], fell [N])。
-    gait_fixed = False 时步态指令取训练范围的中点。"""
+    gait_fixed = False 时步态指令取训练范围的中点。pushes = parse_seq(--push) 的结果, 到点时推所有世界。"""
+    push_at = {int(round(k / env.dt)): f[:2] for k, f in pushes}
     N = env.n
     env.ep_len = max(env.ep_len, steps + 5)
     if not gait_fixed:                                               # 训练时步态指令是个范围的话, 回放取中点
@@ -66,6 +68,8 @@ def rollout(env, act, steps, seq, wz0, gait_fixed, hold_heading=1.5):
             qq = env.qpos[:, 3:7]
             yaw = torch.atan2(2 * (qq[:, 0] * qq[:, 3] + qq[:, 1] * qq[:, 2]), 1 - 2 * (qq[:, 2] ** 2 + qq[:, 3] ** 2))
             env.cmd[:, 2] = env.cmd_goal[:, 2] = (wz - hold_heading * yaw).clamp(-0.3, 0.3)
+        if t in push_at:
+            env.push(torch.arange(N, device=env.dev), torch.tensor(push_at[t], device=env.dev).expand(N, 2))
         obs, _ = env.observe()
         q_hist[t] = env.qpos
         c_hist[t] = env.contact.to(torch.uint8)
@@ -115,12 +119,14 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--hold-heading", type=float, default=1.5, help="保持朝向的增益, 0 = 关闭(策略自己走会慢慢拐弯)")
     p.add_argument("--seq", default="", help="按时间换指令, 分号隔开的 秒:vx,vy,wz[,步频,着地比例]; 给了就不看 --cmd/--gait。站定(速度全 0)时不做保持朝向")
+    p.add_argument("--push", default="", help="按时间推躯干, 分号隔开的 秒:fx,fy(世界系, 牛; x 朝前, y 朝左), 每次 0.2 秒")
     a = p.parse_args()
 
     seq = parse_seq(a.seq)
     fix, (vx, vy, wz) = fixed_cmd(seq, a.cmd, a.gait)
     env, act, meta = load_policy(a.policy, a.worlds, seed=a.seed, random_yaw=False, **fix)
-    q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz, bool(a.gait), a.hold_heading)
+    pushes = parse_seq(a.push)
+    q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz, bool(a.gait), a.hold_heading, pushes)
 
     m, bodies, geoms = model_info(meta["env"].get("xml", "models/humanoid_pd.xml"))
     d = mujoco.MjData(m)
@@ -134,7 +140,8 @@ if __name__ == "__main__":
     label = a.label or f"第 {meta['iteration']} 轮"
     out = a.out or f"web/replays/it_{meta['iteration']:05d}.json"
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    json.dump(dict(meta=dict(label=label, iteration=meta["iteration"], dt=float(env.dt), cmd=[vx, vy, wz], gait=env.gait[0].tolist(), seq=a.seq),
+    json.dump(dict(meta=dict(label=label, iteration=meta["iteration"], dt=float(env.dt), cmd=[vx, vy, wz], gait=env.gait[0].tolist(), seq=a.seq,
+                             pushes=[[k, *f[:2]] for k, f in pushes], push_dur=env.push_len * float(env.dt)),
                    bodies=bodies, geoms=geoms, worlds=worlds), open(out, "w"), separators=(",", ":"))
 
     # 更新回放列表(同名文件覆盖并移到最后)

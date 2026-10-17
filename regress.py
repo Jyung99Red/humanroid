@@ -45,7 +45,10 @@ METRICS = {
     "foot_lr_diff": ("左右脚俯仰差 °", "err", 3.0, None),
     "slip_cms": ("踩地打滑 cm/s", "err", 2.0, None),
     "random_fall": ("随机换指令 20 秒摔倒(人/1024)", "err", 3, None),
+    "push_150": ("推 150 N 摔倒(人/512, 站和走各半)", "err", 10, None),
+    "push_250": ("推 250 N 摔倒(人/512, 站和走各半)", "err", 10, None),
 }
+PUSH_FORCES = (150, 250)                                   # 牛, 推躯干 0.2 秒; 50 kg 的人 250 N 约等于被结实地推一把
 
 
 def mid(r):
@@ -151,6 +154,39 @@ def run_random(env, act, seconds=20.0):
     return dict(random_fall=int(fell.sum()))
 
 
+@torch.no_grad()
+def run_push(env, act, seconds=6.0, at=2.0):
+    """测验 5: 一半站着、一半以 0.8 m/s 走, 第 2 秒从随机方向推躯干一次(env.push), 数到第 6 秒摔倒的人形。返回 (指标, 明细行)。"""
+    (vx_r, _, _), (f_r, d_r) = env.cmd_rng, env.gait_rng
+    walk = WALK_V if vx_r[0] <= WALK_V <= vx_r[1] else mid(vx_r)
+    groups = [(F, kind) for F in PUSH_FORCES for kind in ("stand", "walk")]
+    reps = env.n // len(groups)
+    kinds = [kind for _, kind in groups for _ in range(reps)]
+    kinds += [kinds[0]] * (env.n - len(kinds))
+    cmd = torch.tensor([[0.0 if k == "stand" else walk, 0.0, 0.0] for k in kinds], device=env.dev)
+    gt = torch.tensor([[mid(f_r), 1.0 if k == "stand" else mid(d_r)] for k in kinds], device=env.dev)
+    force = torch.tensor([F for F, _ in groups for _ in range(reps)] + [0.0] * (env.n - reps * len(groups)), device=env.dev)
+    ang = torch.rand(env.n, device=env.dev, generator=torch.Generator(device=env.dev).manual_seed(0)) * 2 * torch.pi
+    env.cmd_period = env.ep_len = 10 ** 9
+    env.reset_idx(torch.arange(env.n, device=env.dev))
+    env.t[:] = 0
+    env.set_cmd(cmd, gt)
+    fell = torch.zeros(env.n, dtype=torch.bool, device=env.dev)
+    for t in range(int(seconds / env.dt)):
+        if t == int(at / env.dt):
+            env.push(torch.arange(env.n, device=env.dev), torch.stack([torch.cos(ang), torch.sin(ang)], 1) * force[:, None])
+        obs, _ = env.observe()
+        _, _, _, te, _, _ = env.step(act(obs))
+        fell |= te
+        env.set_cmd(cmd, gt)
+    out, rows = {}, []
+    for i, (F, kind) in enumerate(groups):
+        n = int(fell[i * reps:(i + 1) * reps].sum())
+        out[f"push_{F}"] = out.get(f"push_{F}", 0) + n * 256 / reps     # 换算成每组 256 人
+        rows.append(f"  推 {F} N · {'站着' if kind == 'stand' else f'走 {walk} m/s'}: 摔 {n}/{reps}")
+    return out, rows
+
+
 def verdict(key, val, base):
     _, kind, tol, rng = METRICS[key]
     dist = lambda v: max(rng[0] - v, 0.0, v - rng[1]) if rng else v
@@ -174,6 +210,10 @@ if __name__ == "__main__":
     print("\n".join(rows))
     res.update(run_pose(env, act))
     res.update(run_random(env, act))
+    push_res, push_rows = run_push(env, act)
+    res.update(push_res)
+    print("测验 5 推搡明细:")
+    print("\n".join(push_rows))
     base = json.load(open(a.baseline, encoding="utf-8"))["metrics"] if a.baseline else {}
     print(f"\n{'指标':32s} {'本次':>8s} {'基线':>8s}  判定")
     bad = 0

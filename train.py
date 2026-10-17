@@ -47,6 +47,8 @@ p.add_argument("--priv-add", type=str, default="", help="只给评论家加的�
 p.add_argument("--save-every", type=int, default=10)
 p.add_argument("--snap-every", type=int, default=50, help="每多少轮存一个快照到 snaps/(每个约 330 KB, 导出成时间线约 0.5 MB); 回放时间线按快照逐个看")
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--push", type=float, default=0.0, help="随机推躯干的最大力(牛), 例如 150; 0 = 不推。每次推 0.2 秒, 方向随机, 大小在 0~它之间")
+p.add_argument("--push-period", default="2,5", help="多少秒推一次 lo,hi(每次随机抽)")
 p.add_argument("--std", type=float, default=0.0, help="续训时把探索噪声的标准差重置成这个值(例如 0.3); 0 = 沿用检查点的。"
                "std 塌到 0.15 左右时, 学习率按 KL 自动调会被压到下限, 策略几乎学不动新东西")
 p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
@@ -73,6 +75,7 @@ rng = lambda s: tuple(float(v) for v in s.split(","))
 env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy), cmd_wz=rng(a.wz), cmd_duty=rng(a.duty),
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
                gait_period=a.gait_period, cmd_stand=a.stand, cmd_acc=a.cmd_acc or None,
+               push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
                cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)

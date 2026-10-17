@@ -56,6 +56,7 @@ if __name__ == "__main__":
     p.add_argument("--worlds", type=int, default=3, help="每个快照跑几个人形")
     p.add_argument("--steps", type=int, default=700)
     p.add_argument("--seq", default="0:1.0,0,0; 4:0,0,0,0.925,1; 6.5:-0.4,0,0; 10.5:0,0,0,0.925,1")
+    p.add_argument("--push", default="", help="按时间推躯干, 同 export.py --push")
     p.add_argument("--cmd", default="1.0,0,0")
     p.add_argument("--gait", default="")
     p.add_argument("--hold-heading", type=float, default=1.5)
@@ -77,13 +78,13 @@ if __name__ == "__main__":
 
     out_dir = os.path.join("web", "replays", f"tl_{a.name}")
     os.makedirs(out_dir, exist_ok=True)
-    params = dict(seq=a.seq, cmd=a.cmd, gait=a.gait, worlds=a.worlds, steps=a.steps, hold_heading=a.hold_heading, seed=a.seed)
+    params = dict(seq=a.seq, push=a.push, cmd=a.cmd, gait=a.gait, worlds=a.worlds, steps=a.steps, hold_heading=a.hold_heading, seed=a.seed)
     man_path = os.path.join(out_dir, "manifest.json")
     old = json.load(open(man_path, encoding="utf-8")) if os.path.exists(man_path) else {}
     reuse = {s["it"]: s for s in old.get("snaps", [])
              if old.get("params") == params and os.path.exists(os.path.join(out_dir, s["file"]))}
 
-    seq = parse_seq(a.seq)
+    seq, pushes = parse_seq(a.seq), parse_seq(a.push)
     fix, (vx0, vy0, wz0) = fixed_cmd(seq, a.cmd, a.gait)
     xml = None
     entries, t0 = {it: reuse[it] for it, _, _ in picked if it in reuse}, time.time()
@@ -104,7 +105,7 @@ if __name__ == "__main__":
             def act(obs):
                 return torch.cat([f(obs[i * K:(i + 1) * K]) for i, f in enumerate(acts)])
 
-            q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz0, bool(a.gait), a.hold_heading)
+            q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz0, bool(a.gait), a.hold_heading, pushes)
             m, bodies, geoms = model_info(xml)
             d = mujoco.MjData(m)
             for i, (it, _, _) in enumerate(part):
@@ -126,7 +127,7 @@ if __name__ == "__main__":
     label = a.label or f"时间线 · {os.path.basename(runs[0])}→{os.path.basename(runs[-1])} · {snaps[0]['it']}~{snaps[-1]['it']}轮"
     json.dump(dict(type="timeline", label=label, params=params, xml=xml or old.get("xml"), dt=0.02, steps=a.steps, nworld=a.worlds,
                    scale=dict(pos=POS_SCALE, quat=QUAT_SCALE, vx=VX_SCALE), runs=[os.path.basename(r) for r in runs],
-                   version=int(time.time()), bodies=bodies, geoms=geoms, snaps=snaps),
+                   version=int(time.time()), pushes=[[k, *f[:2]] for k, f in pushes], push_dur=0.2, bodies=bodies, geoms=geoms, snaps=snaps),
               open(man_path, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
 
     idx_path = os.path.join("web", "replays", "index.json")

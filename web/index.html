@@ -146,7 +146,7 @@ async function loadRun(file) {
   const d = await r.json();
   if (d.type === 'timeline') {                     // 时间线: 只有清单, 每个快照的轨迹按需下载(snapIdx 指当前显示的快照)
     d.timeline = true; d.dir = file.slice(0, file.lastIndexOf('/') + 1); d.cap = d.steps;
-    d.meta = { label: d.label, dt: d.dt }; d.snapIdx = -1; d.worlds = null;
+    d.meta = { label: d.label, dt: d.dt, pushes: d.pushes, push_dur: d.push_dur }; d.snapIdx = -1; d.worlds = null;
   }
   runCache.set(file, d); return d;
 }
@@ -459,7 +459,10 @@ function buildRun(data, runIdx, laneStart) {
     const trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color: shirt, transparent: true, opacity: 0.85 }));
     trail.frustumCulled = false; wg.add(trail);
     const x0 = w.xpos[1 * 3 + 0], y0 = w.xpos[1 * 3 + 1];
-    return { w, bodyObjs, mats, links, skel, trail, lane, shirt, x0, y0, nb };
+    // 推力箭头(回放里记了推的时刻才有): 从躯干外侧指向躯干, 推的时候显示
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0.55, 0xff3b30, 0.18, 0.13);
+    arrow.visible = false; wg.add(arrow);
+    return { w, bodyObjs, mats, links, skel, trail, lane, shirt, x0, y0, nb, arrow };
   });
   const dt = data.meta.dt;
   return { data, group, worlds, dt, runIdx, laneStart, nLanes: worlds.length, label: runLabel(data),
@@ -492,6 +495,13 @@ function applyWorld(run, W, t) {
     o.quaternion.slerpQuaternions(tmpQ0, tmpQ1, a);
   }
   updateLinks(W);
+  // 推力箭头: 推的那 0.2 秒再多留 0.3 秒, 看得清
+  const pu = (run.data.meta.pushes || []).find(([t0]) => t >= t0 && t < t0 + (run.data.meta.push_dur || 0.2) + 0.3);
+  W.arrow.visible = !!pu && t <= (w.n - 1) * run.dt;
+  if (W.arrow.visible) {
+    const dir = tmpA.set(pu[1], pu[2], 0).normalize(), torso = bodyObjs[1].position;
+    W.arrow.setDirection(dir); W.arrow.position.copy(torso).addScaledVector(dir, -0.75);
+  }
   // 轨迹线: 只画到当前帧
   const pos = W.trail.geometry.attributes.position.array, upto = Math.min(i0, w.n - 1);
   for (let i = 0; i <= upto; i++) { const p = (i * nb + 1) * 3; pos[i * 3] = w.xpos[p]; pos[i * 3 + 1] = w.xpos[p + 1]; pos[i * 3 + 2] = 0.012; }
