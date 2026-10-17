@@ -14,7 +14,7 @@
 .venv\Scripts\python.exe train.py --resume runs/walk1/ckpt.pt --iters 500 --out runs/walk1   # 续训
 .venv\Scripts\python.exe export.py runs/walk1/policy.pt --worlds 6      # 导出回放到 web/replays/（--cmd vx,vy,wz  --gait 步频,着地比例）
 .venv\Scripts\python.exe export.py runs/xxx/policy.pt --steps 700 --seq "0:1.0,0,0; 4:0,0,0,0.925,1; 6.5:-0.4,0,0"   # 按时间换指令(秒:vx,vy,wz[,步频,着地比例]): 走 -> 站定 -> 倒退
-.venv\Scripts\python.exe export_timeline.py runs/knee3 --name knee3      # 整条训练链的所有快照导出成时间线, 回放页面拖"轮数"逐个看(默认指令: 走 -> 站 -> 倒退 -> 站)
+.venv\Scripts\python.exe export_timeline.py runs/sp2 --name sp2 --solo   # 整条训练链的所有快照导出成时间线, 回放页面拖"轮数"逐个看; --solo 列表只留它, 其他回放归档
 .venv\Scripts\python.exe eval_policy.py runs/xxx/policy.pt              # 测跟指令: 实际步频、着地比例、速度
 .venv\Scripts\python.exe regress.py runs/新/policy.pt --baseline runs/旧/regress.json --save   # 回归测验, 和基线比
 .venv\Scripts\python.exe foot_phase.py runs/xxx/policy.pt              # 按步态时钟分 10 段, 左右脚各自的俯仰(脚跟着地/踩平/蹬地对不对)
@@ -381,6 +381,7 @@ push3 怕侧推（站着从侧面推 150 N 摔一半多），侧面要横着跨�
   ```
 
 ## 回放页面
+- **列表只留最新的时间线**（2026-10-17 起，用户的意思：列表太长，前面的用滑块看）。每次训练完用 `export_timeline.py <最新一段> --name <名> --solo` 重新导出，以前的快照直接复用，只跑新的；列表里其他回放的文件移到 `web/replays/archive/`，列表项记在 `archive/index.json`，要再看就把文件和那一条放回来。现在是 `tl_sp2`（sym1→sp2，第 50～6400 轮，走→左右侧移→倒退→站，推 5 次 200 N）。D 版（官方身体）和以前的单独回放都在 archive 里。
 - **推力箭头**：回放里记了推的时刻（`export.py --push`）时，推的 0.2 秒再多留 0.3 秒，在躯干旁边画一个红色箭头指向躯干。
 - **时间线**（2026-10-16 加）：列表里标"轮数可拖"的是时间线。选中后底部多一条"轮数"滑块，◀ ▶ 或 ↑/↓ 一次走一个快照。换轮数时人形不重建、时间点不变，可以暂停在某一刻，拖轮数看同一个动作是怎么练出来的。和普通回放一起勾选可以同台对比；勾了两条时间线时，第二条取轮数最接近的快照。
   - `tl_knee3`：sym1 → sym2 → stand1～3 → knee2 → knee3，第 50～4200 轮共 84 个快照（每 50 轮一个），每个快照 3 个人形、0.5 MB，共 36 MB，导出 75 秒。早期的快照没练过站定和倒退，走到那一段会摔。

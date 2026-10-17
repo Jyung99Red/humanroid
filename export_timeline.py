@@ -8,10 +8,12 @@
 输出 web/replays/tl_<名字>/: manifest.json(刚体、几何体、每个快照的轮数和每个世界的帧数) + 每个快照一个 it_XXXXX.bin。
 .bin 是小端二进制, 按世界依次放: 位置 int16(毫米)、朝向 int16(×32767, wxyz)、前进速度 int16(毫米/秒)、两脚接触 uint8。
 再跑一次时, 指令序列/世界数/步数没变的快照直接复用, 只跑新的。
+--solo: 回放列表只留这条时间线, 其他回放的文件移到 web/replays/archive/(不删), 列表项记在 archive/index.json, 放回去就能再看。
 """
 import argparse
 import json
 import os
+import shutil
 import time
 
 import mujoco
@@ -64,6 +66,7 @@ if __name__ == "__main__":
     p.add_argument("--from", dest="it_from", type=int, default=0)
     p.add_argument("--to", dest="it_to", type=int, default=10 ** 9)
     p.add_argument("--every", type=int, default=0, help="只取轮数是它倍数的快照; 0 = 全部")
+    p.add_argument("--solo", action="store_true", help="回放列表只留这条时间线, 其他回放移到 web/replays/archive/")
     p.add_argument("--batch", type=int, default=32, help="一个环境里最多同时跑几个快照")
     a = p.parse_args()
 
@@ -135,6 +138,22 @@ if __name__ == "__main__":
     file = f"tl_{a.name}/manifest.json"
     idx = [e for e in idx if e["file"] != file]
     idx.append(dict(file=file, label=label, iteration=snaps[-1]["it"], timeline=True))
+    if a.solo:                                          # 其他回放归档: 文件(时间线是整个目录)移走, 列表项记到 archive/index.json
+        arc_dir = os.path.join("web", "replays", "archive")
+        os.makedirs(arc_dir, exist_ok=True)
+        arc_path = os.path.join(arc_dir, "index.json")
+        arc = json.load(open(arc_path, encoding="utf-8")) if os.path.exists(arc_path) else []
+        for e in idx[:-1]:
+            src = os.path.join("web", "replays", e["file"].split("/")[0])
+            if os.path.exists(src):
+                dst = os.path.join(arc_dir, os.path.basename(src))
+                if os.path.exists(dst):
+                    shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+                shutil.move(src, dst)
+            arc = [x for x in arc if x["file"] != e["file"]] + [e]
+        json.dump(arc, open(arc_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        print(f"其他 {len(idx) - 1} 条回放移到 {arc_dir}/")
+        idx = idx[-1:]
     json.dump(idx, open(idx_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     size = sum(os.path.getsize(os.path.join(out_dir, s["file"])) for s in snaps) / 1e6
     falls = sum(w["fell"] for s in snaps for w in s["worlds"])
