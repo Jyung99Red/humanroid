@@ -56,6 +56,10 @@ REWARD = dict(
     stand_feet=0.0,    # 指令是站定(着地比例 1)、又不在被推后 PUSH_GRACE 秒内时, 哪只脚离地罚哪只(两只都离地罚满 1)。
                        # 开了随机推搡后策略学会"一直原地踏步"(随时准备跨步, 不容易被推倒), clock 压不住。例如 2.0
     knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
+    # 起身模式(getup=True)只用下面这几项 + energy、action_rate, 其他走路的项不算
+    getup_height=1.0,  # 躯干高度 / 站立高度(封顶 1)
+    getup_up=1.0,      # 躯干立直程度(重力在躯干系的 -z 分量, 倒立以下为 0)
+    getup_stand=2.0,   # 站起来了(高度 > 90%、立直、只有脚着地)以后: 一半看不动(水平速度小), 一半看姿态接近默认站姿(交给走路策略时好接)
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
 FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原点平放时离地 0.027)。真人摆到中途脚底只离地几厘米; 定成 10 cm 会逼出踮脚走
@@ -154,7 +158,7 @@ class HumanoidEnv:
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
                  arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None,
-                 push_force=0.0, push_period=(100, 250), push_len=10):
+                 push_force=0.0, push_period=(100, 250), push_len=10, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -213,6 +217,12 @@ class HumanoidEnv:
         self.waist_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("abdomen_x", "abdomen_z")]
         self.knee_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("knee_right", "knee_left")]
         self.root_z0 = float(mjm.qpos0[2]) + 0.02
+        # 起身模式: 开局从倒地姿态库(make_fallen.py 生成)里抽一个, 转一个随机朝向; 碰地不终止, 只有超时
+        self.getup, self.getup_stand_frac = getup, getup_stand_frac
+        if getup:
+            bank = torch.load(getup_poses, map_location=self.dev)
+            self.fallen, self.fallen_cls, self.fallen_names = bank["qpos"].float(), bank["cls"], bank["names"]
+            self.getup_pick = torch.full((nworld,), -1, dtype=torch.long, device=self.dev)
 
         wp.set_device("cuda:0")
         self.m = mjw.put_model(mjm)
@@ -291,6 +301,17 @@ class HumanoidEnv:
         qpos[:, self.qadr] = self.q_def + (torch.rand(k, self.nu, **f) * 2 - 1) * 0.05
         qvel = torch.zeros(k, self.qvel.shape[1], **f)
         qvel[:, :6] = (torch.rand(k, 6, **f) * 2 - 1) * 0.1
+        if self.getup:                                    # 大部分从倒地姿态开始(朝向随机转), 少数站着开始(学会站住不动)
+            lie = torch.rand(k, device=self.dev) >= self.getup_stand_frac
+            pick = torch.randint(0, self.fallen.shape[0], (k,), device=self.dev)
+            self.getup_pick[idx] = torch.where(lie, pick, -1)      # 测验按姿态类别分开统计用
+            p = self.fallen[pick]
+            p[:, :2] = 0
+            cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)       # 绕世界 z 转 yaw: q_yaw * q
+            w, x, y, z = p[:, 3], p[:, 4], p[:, 5], p[:, 6]
+            p[:, 3:7] = torch.stack([cy * w - sy * z, cy * x - sy * y, cy * y + sy * x, cy * z + sy * w], 1)
+            qpos[lie] = p[lie]
+            qvel[lie] = 0
         self.qpos[idx], self.qvel[idx] = qpos, qvel
         self.ctrl[idx] = self.q_def
         self.warm[idx] = 0
@@ -555,7 +576,10 @@ class HumanoidEnv:
             r = r - rw["point_slip"] * (on * v2).sum(dim=(1, 2)) * (self.t > 1)
             self.point_prev.copy_(pts)
 
-        terminated = fell | ~torch.isfinite(self.qpos).all(dim=1)
+        if self.getup:
+            r = self._getup_reward(g, fell)
+        self.m_fell = fell
+        terminated = (fell & (not self.getup)) | ~torch.isfinite(self.qpos).all(dim=1)
         truncated = (self.t >= self.ep_len) & ~terminated
         done = terminated | truncated
 
@@ -572,6 +596,24 @@ class HumanoidEnv:
             self._ramp_cmd()
         obs, critic = self._obs()
         return obs, critic, r, terminated, truncated, info
+
+    def stood_up(self, g=None, fell=None):
+        """站起来了: 躯干高度 > 站立的 90%、立直(倾斜 < 约 25°)、只有脚着地。起身策略交给走路策略也按它判(再加持续一段时间)。"""
+        g = quat_to_gravity(self.qpos[:, 3:7]) if g is None else g
+        fell = self.ground_contact()[0] if fell is None else fell
+        return (self.qpos[:, 2] > 0.9 * self.root_z0) & (-g[:, 2] > 0.9) & ~fell
+
+    def _getup_reward(self, g, fell):
+        rw = self.rw
+        z = (self.qpos[:, 2] / self.root_z0).clamp(0, 1)
+        up = (-g[:, 2]).clamp(min=0)
+        stood = self.stood_up(g, fell).float()
+        still = torch.exp(-(self.qvel[:, :2] ** 2).sum(dim=1) / 0.1)
+        pose = torch.exp(-((self.qpos[:, self.qadr] - self.q_def) ** 2).sum(dim=1) / 1.0)
+        self.m_stood = stood
+        r = rw["getup_height"] * z + rw["getup_up"] * up + rw["getup_stand"] * stood * 0.5 * (still + pose)
+        r = r - rw["action_rate"] * ((self.action - self.prev_action) ** 2).sum(dim=1)
+        return r - rw["energy"] * (self.frc[:, self.dadr] * self.qvel[:, self.dadr]).abs().sum(dim=1)
 
     def diagnostics(self):
         """dropped_worlds: 接触/约束池溢出(会悄悄丢约束, 必须为 0); iter_limit_worlds: 求解器迭代到上限(只是没完全收敛, 少量无妨)。"""

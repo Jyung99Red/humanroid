@@ -53,6 +53,7 @@ p.add_argument("--kl", type=float, default=0.01, help="KL 目标: 学习率按�
 p.add_argument("--std", type=float, default=0.0, help="续训时把探索噪声的标准差重置成这个值(例如 0.3); 0 = 沿用检查点的。"
                "std 塌到 0.15 左右时, 学习率按 KL 自动调会被压到下限, 策略几乎学不动新东西")
 p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
+p.add_argument("--getup", action="store_true", help="训练起身策略: 从倒地姿态库(make_fallen.py)开局, 碰地不终止, 用 getup_* 奖励; 观测不带指令和步态时钟")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
 
@@ -67,6 +68,8 @@ if ck is not None and "obs_layout" in ck:
     priv = [n for n, _ in ck["critic_layout"]][len(obs):]
 else:
     obs, priv = list(DEFAULT_OBS) + ["gait"], list(DEFAULT_PRIV)      # 从头训练: 默认观测 + 步态指令
+    if a.getup:                                                       # 起身策略不跟指令、不按步态走
+        obs = [n for n in DEFAULT_OBS if n not in ("cmd", "clock")]
 split = lambda s: [x for x in s.split(",") if x]
 unknown = set(split(a.obs_add) + split(a.priv_add)) - set(OBS_BLOCKS)
 assert not unknown, f"未知观测块: {unknown}, 可用: {list(OBS_BLOCKS)}"
@@ -77,7 +80,7 @@ env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy)
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
                gait_period=a.gait_period, cmd_stand=a.stand, cmd_acc=a.cmd_acc or None,
                push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
-               cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
+               getup=a.getup, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
 ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound, kl_target=a.kl)
