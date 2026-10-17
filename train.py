@@ -49,6 +49,7 @@ p.add_argument("--snap-every", type=int, default=50, help="每多少轮存一个
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--push", type=float, default=0.0, help="随机推躯干的最大力(牛), 例如 150; 0 = 不推。每次推 0.2 秒, 方向随机, 大小在 0~它之间")
 p.add_argument("--push-period", default="2,5", help="多少秒推一次 lo,hi(每次随机抽)")
+p.add_argument("--kl", type=float, default=0.01, help="KL 目标: 学习率按每轮的 KL 自动调(大于 2 倍降、小于一半升)。std 塌到 0.15 左右时学习率会被压到 1e-5 附近, 调大它能学快一些, 例如 0.02")
 p.add_argument("--std", type=float, default=0.0, help="续训时把探索噪声的标准差重置成这个值(例如 0.3); 0 = 沿用检查点的。"
                "std 塌到 0.15 左右时, 学习率按 KL 自动调会被压到下限, 策略几乎学不动新东西")
 p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
@@ -79,7 +80,7 @@ env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy)
                cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
-ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound)
+ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound, kl_target=a.kl)
 if ck is not None:
     ppo.load(ck)
     print(f"从 {a.resume} 接着练, 已有 {ppo.iteration} 轮")
