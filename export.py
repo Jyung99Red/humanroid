@@ -8,6 +8,8 @@
 坐标是 MuJoCo 原样(Z 轴朝上, 四元数 wxyz), 转成 three.js 的朝向由网页负责。
 推演和模型信息的函数(parse_seq / fixed_cmd / rollout / model_info / kinematics)也给 export_timeline.py 用。
 --push "秒:fx,fy; ..." 在这些时刻推躯干(世界系, 牛; x 朝前, y 朝左), 每次 0.2 秒, 网页上画红色箭头。
+--getup runs/getup2/policy.pt: 走路策略 + 起身策略切换(combo.py), --lying 0.5 的人形从倒地姿态开局; 摔倒不再结束记录。
+    python export.py runs/sp2/policy.pt --getup runs/getup2/policy.pt --lying 0.5 --steps 750 --seq "0:0,0,0,0.925,1; 6:0.8,0,0" --push "2:0,-400"
 """
 import argparse
 import json
@@ -48,6 +50,8 @@ def rollout(env, act, steps, seq, wz0, gait_fixed, hold_heading=1.5, pushes=()):
     env.cmd_t[:] = 0
     env.reset_idx(torch.arange(N, device=env.dev))
     env._sample_cmd(torch.arange(N, device=env.dev))
+    if hasattr(act, "reset"):                                        # 起身 + 走路切换器(combo.Switcher): 按开局姿态定谁先起身
+        act.reset()
     gait0 = env.gait[0].clone()
     T, wz = steps, wz0
     q_hist = torch.zeros(T, N, env.qpos.shape[1], device=env.dev)
@@ -78,6 +82,8 @@ def rollout(env, act, steps, seq, wz0, gait_fixed, hold_heading=1.5, pushes=()):
         newly = (te | tr) & (end == T)
         end[newly] = t + 1                                          # 这一帧(摔倒前的最后状态)还是有效的
         fell |= te & newly
+    if hasattr(act, "n_falls"):                                      # 起身模式下摔倒不终止, 摔倒 = 切换器记到过摔倒
+        fell = act.n_falls > 0
     return q_hist.cpu().numpy(), vx_hist.cpu().numpy(), c_hist.cpu().numpy(), end.cpu().numpy(), fell.cpu().numpy()
 
 
@@ -120,11 +126,18 @@ if __name__ == "__main__":
     p.add_argument("--hold-heading", type=float, default=1.5, help="保持朝向的增益, 0 = 关闭(策略自己走会慢慢拐弯)")
     p.add_argument("--seq", default="", help="按时间换指令, 分号隔开的 秒:vx,vy,wz[,步频,着地比例]; 给了就不看 --cmd/--gait。站定(速度全 0)时不做保持朝向")
     p.add_argument("--push", default="", help="按时间推躯干, 分号隔开的 秒:fx,fy(世界系, 牛; x 朝前, y 朝左), 每次 0.2 秒")
+    p.add_argument("--getup", default="", help="起身策略文件; 给了就和走路策略切换(摔倒后起身)")
+    p.add_argument("--lying", type=float, default=0.5, help="配合 --getup: 多大比例的人形从倒地姿态开局")
     a = p.parse_args()
 
     seq = parse_seq(a.seq)
     fix, (vx, vy, wz) = fixed_cmd(seq, a.cmd, a.gait)
-    env, act, meta = load_policy(a.policy, a.worlds, seed=a.seed, random_yaw=False, **fix)
+    if a.getup:
+        from combo import make_combo
+        env, act, meta = make_combo(a.policy, a.getup, a.worlds, seed=a.seed, random_yaw=False, getup_stand_frac=1 - a.lying, **fix)
+        meta["iteration"] = meta["getup_iteration"]
+    else:
+        env, act, meta = load_policy(a.policy, a.worlds, seed=a.seed, random_yaw=False, **fix)
     pushes = parse_seq(a.push)
     q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz, bool(a.gait), a.hold_heading, pushes)
 

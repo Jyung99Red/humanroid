@@ -10,6 +10,7 @@ import math
 import os
 import time
 
+import mujoco
 import torch
 
 from env import DEFAULT_OBS, DEFAULT_PRIV, OBS_BLOCKS, HumanoidEnv, REWARD
@@ -54,6 +55,10 @@ p.add_argument("--std", type=float, default=0.0, help="续训时把探索噪声�
                "std 塌到 0.15 左右时, 学习率按 KL 自动调会被压到下限, 策略几乎学不动新东西")
 p.add_argument("--bound", type=float, default=0.0, help="动作边界损失的权重(例如 10): 动作均值超出目标角不被关节限位裁掉的范围时罚; 0 = 不加")
 p.add_argument("--getup", action="store_true", help="训练起身策略: 从倒地姿态库(make_fallen.py)开局, 碰地不终止, 用 getup_* 奖励; 观测不带指令和步态时钟")
+p.add_argument("--assist", type=float, default=0.0, help="起身训练的辅助力起点(体重的几成, 例如 0.6): 向上拉躯干, 站起来的时间比例 > 0.5 就每轮减 0.005, 减到 0 为止")
+p.add_argument("--assist-at", default="torso", help="辅助力拉哪个刚体: torso(躯干, 会替手把上身顶起来, getup3~7 只用腿蹬) 或 pelvis(胯部)")
+p.add_argument("--effort-ramp", action="store_true", help="费力惩罚 getup_effort 跟着辅助力加: 权重 = 给定值 x (1 - 当前辅助力 / 起点)。从头就加满时策略学成躺着不动(getup11)")
+p.add_argument("--full-range", action="store_true", help="动作按关节各自裁到够得着整个活动范围(默认统一裁到 ±1.5, 膝盖最多弯 73°); 起身用")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
 
@@ -80,7 +85,7 @@ env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy)
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
                gait_period=a.gait_period, cmd_stand=a.stand, cmd_acc=a.cmd_acc or None,
                push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
-               getup=a.getup, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
+               getup=a.getup, act_clip="full" if a.full_range else 1.5, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
 ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound, kl_target=a.kl)
@@ -104,7 +109,7 @@ t_start = time.perf_counter()
 
 
 def save(path):
-    torch.save(dict(ppo.state(), env=env_cfg), path)
+    torch.save(dict(ppo.state(), env=env_cfg, extra=dict(assist=env.assist)), path)
 
 
 def save_policy(path):
@@ -113,8 +118,23 @@ def save_policy(path):
                     iteration=ppo.iteration, hidden=(512, 256, 128)), path)
 
 
+env.assist = a.assist
+env.assist_id = mujoco.mj_name2id(env.mjm, mujoco.mjtObj.mjOBJ_BODY, a.assist_at)
+if a.effort_ramp:
+    env.rw["getup_effort"] = rw.get("getup_effort", 0.0) * (1 - env.assist / a.assist if a.assist else 1.0)
+if ck is not None and a.getup and "assist" in ck.get("extra", {}) and not a.assist:
+    env.assist = ck["extra"]["assist"]                              # 续训接着上次的辅助力
 for _ in range(a.iters):
     m = ppo.train_iteration()
+    if a.getup:                                                     # 这一轮里"站着"的时间比例(含 10% 站着开局的), 辅助力按它减
+        m["stood"] = float(env.stood_sum / max(env.stood_cnt, 1))
+        env.stood_sum, env.stood_cnt = 0.0, 0
+        m["assist"] = env.assist
+        if env.assist > 0 and m["stood"] > 0.5:
+            env.assist = max(0.0, env.assist - 0.005)
+        if a.effort_ramp:
+            env.rw["getup_effort"] = rw.get("getup_effort", 0.0) * (1 - env.assist / a.assist if a.assist else 1.0)
+            m["effort_w"] = env.rw["getup_effort"]
     m["time"] = time.perf_counter() - t_start
     if writer is None:
         writer = csv.DictWriter(logf, fieldnames=list(m))
@@ -127,7 +147,9 @@ for _ in range(a.iters):
           f"回合长 {m['ep_len']:6.1f} | 回合回报 {m['ep_ret']:7.1f} | 摔倒 {m['fall']*100:5.2f}%/步 | "
           f"vx {m['vx']:5.2f} 误差 {m['lin_err']:5.3f} | KL {m['kl']:.4f} lr {m['lr']:.1e} std {m['std']:.3f} | "
           f"vloss {m['vloss']:.3f} clip {m['clipfrac']:.2f}" + (f" | 不对称 {m['sym']:.4f}" if "sym" in m else "")
-          + (f" | 越界 {m['bound']:.3f}" if "bound" in m else ""), flush=True)
+          + (f" | 越界 {m['bound']:.3f}" if "bound" in m else "")
+          + (f" | 站着 {m['stood']:.2f} 辅助 {m['assist']:.3f}" if "stood" in m else "")
+          + (f" 费力权重 {m['effort_w']:.2f}" if "effort_w" in m else ""), flush=True)
     if m["it"] % a.save_every == 0:
         save(os.path.join(a.out, "ckpt.pt"))
         save_policy(os.path.join(a.out, "policy.pt"))

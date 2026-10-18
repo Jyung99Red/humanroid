@@ -58,7 +58,15 @@ REWARD = dict(
     knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
     # 起身模式(getup=True)只用下面这几项 + energy、action_rate, 其他走路的项不算
     getup_height=1.0,  # 躯干高度 / 站立高度(封顶 1)
-    getup_up=1.0,      # 躯干立直程度(重力在躯干系的 -z 分量, 倒立以下为 0)
+    getup_up=1.0,      # 躯干立直程度(重力在躯干系的 -z 分量, 倒立以下为 0) x 高度比: 只算立直时坐着就能拿满, getup1 就卡在坐着
+    getup_air=0.0,     # 起身时身上没有任何部位着地(腾空)就罚。getup3 不加时是"蹬地弹起来": 全部腾空约 0.5 秒, 0.6 秒就站起来。例如 2.0
+    getup_speed=0.0,   # 躯干速度超过 GETUP_MAX_V 的部分(平方)罚, getup3 峰值 3.3 m/s; 真人起身躯干上升不到 1 m/s。例如 2.0
+    getup_spin=0.0,    # 躯干角速度超过 GETUP_MAX_W 的部分(平方)罚, getup3 峰值 13 rad/s(翻腾)。例如 0.2
+    getup_effort=0.0,  # 像肌肉一样算"费力": 各关节 (力矩 / 最大力矩)^2 求和。energy 按机械功率算, 关节不动时用多大力都不扣, 顶到极限也不贵,
+                       # getup6 就只靠腿硬蹬起来(膝、髋峰值 100% 力矩), 手几乎不撑地。例如 0.5
+    getup_hand=0.0,    # 躯干还低(高度 < 站立的 GETUP_HAND_Z)、手撑在地上、躯干正在往上升时给, 每只手一半, 再乘上升速度 / 0.5 m/s(封顶 1)。
+                       # getup7 加了费力惩罚, 仰躺起来手还是 0% 撑地(只用腿蹬)。试过: 只算"手撑 + 躯干离地"(getup8)它碰不到, 没效果;
+                       # "手撑 + 坐起来"(getup9)趴着的撑起上身就不起来了(一直拿奖励)。例如 1.0
     getup_stand=2.0,   # 站起来了(高度 > 90%、立直、只有脚着地)以后: 一半看不动(水平速度小), 一半看姿态接近默认站姿(交给走路策略时好接)
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
@@ -66,6 +74,9 @@ FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原�
 LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
 KNEE_SWING_DEG = 40.0     # 度, 摆腿中途膝盖弯多少(真人走路约 60°, 慢走、侧移小一些)
 KNEE_MIN_DEG = 5.0        # 度, 膝盖至少弯这么多(真人着地期约 5~20°, 站着约 0~5°)
+GETUP_HAND_Z = 0.6        # 躯干高度 / 站立 低于它才算"还低", 手撑地给奖励
+GETUP_MAX_V = 1.0         # m/s, 起身时躯干速度上限(超过才罚)
+GETUP_MAX_W = 4.0         # rad/s, 起身时躯干角速度上限
 PUSH_GRACE = 1.0          # 秒, 被推之后多久内不按步态时钟奖励节奏
 TRACK_FINE = 0.05         # 窄跟踪项的误差尺度: exp(-误差^2 / 0.05), 即 sigma 约 0.22(宽的那两项是 0.25, sigma 0.5)
 WALK_V = 0.3              # m/s, 前进(倒退)指令到这个速度, 脚的姿态规则完全按往前走(倒退)算; 速度指令为 0 时按站定算
@@ -201,6 +212,8 @@ class HumanoidEnv:
         self.scale = action_frac * (self.hi - self.lo)    # 每个关节动作 ±1 对应的角度幅度
         if arm_pose:
             self.scale[self.arm_idx] *= 0.5               # 手臂幅度减半, 不然探索阶段会乱甩
+        if act_clip == "full":                            # 每个关节各自裁到"刚好够得着整个活动范围"(起身用: ±1.5 时膝盖最多指到弯 73°、髋屈 81°, 蹲不起来)
+            self.act_clip = torch.maximum(self.hi - self.q_def, self.q_def - self.lo) / self.scale
         # 摆臂的目标: 手臂各关节相对默认姿势的偏移 = 这个向量 x 摆动量。摆动量为正时右臂往前、左臂往后; 肘不参与(保持默认角度)。
         # arm_swing_amp 是指令 1 m/s 时上臂前后各摆多少弧度
         self.swing_amp = arm_swing_amp
@@ -217,12 +230,17 @@ class HumanoidEnv:
         self.waist_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("abdomen_x", "abdomen_z")]
         self.knee_adr = [int(mjm.jnt_qposadr[mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_JOINT, j)]) for j in ("knee_right", "knee_left")]
         self.root_z0 = float(mjm.qpos0[2]) + 0.02
+        self.tau_max = torch.tensor(mjm.actuator_forcerange[:, 1], dtype=torch.float32)    # 每个执行器的最大力矩(和动作同序)
         # 起身模式: 开局从倒地姿态库(make_fallen.py 生成)里抽一个, 转一个随机朝向; 碰地不终止, 只有超时
         self.getup, self.getup_stand_frac = getup, getup_stand_frac
         if getup:
             bank = torch.load(getup_poses, map_location=self.dev)
             self.fallen, self.fallen_cls, self.fallen_names = bank["qpos"].float(), bank["cls"], bank["names"]
             self.getup_pick = torch.full((nworld,), -1, dtype=torch.long, device=self.dev)
+        # 起身训练的辅助力(课程): 向上拉躯干, 大小 = assist x 体重; train.py --assist 按站起来的比例逐步减到 0。回放、测验、网页里都是 0
+        self.assist, self.weight = 0.0, float(mjm.body_mass.sum()) * 9.81
+        self.assist_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "torso")   # 拉哪个刚体: 躯干(getup3), 或胯部(train.py --assist-at pelvis, 不替手把上身顶起来)
+        self.stood_sum, self.stood_cnt = 0.0, 0
 
         wp.set_device("cuda:0")
         self.m = mjw.put_model(mjm)
@@ -256,6 +274,13 @@ class HumanoidEnv:
             elif body in ("foot_right", "foot_left"):
                 role[g] = 0 if body == "foot_right" else 1
         self.geom_role = role.to(self.dev)
+        # 起身用的接触分组: 0 右手(手 + 前臂), 1 左手, 2 躯干(躯干、头、腰、胯、大腿、上臂), 3 其他(脚、小腿、地面)
+        grp = []
+        for g in range(mjm.ngeom):
+            b = mujoco.mj_id2name(mjm, mujoco.mjtObj.mjOBJ_BODY, int(mjm.geom_bodyid[g]))
+            grp.append(0 if b in ("hand_right", "lower_arm_right") else 1 if b in ("hand_left", "lower_arm_left")
+                       else 2 if b in ("torso", "head", "waist_lower", "pelvis") or b.startswith(("thigh", "upper_arm")) else 3)
+        self.geom_grp = torch.tensor(grp, dtype=torch.long, device=self.dev)
 
         mjw.step(self.m, self.d)                           # 热身, 编译 kernel
         with wp.ScopedCapture() as cap:                    # 一个策略步 = decimation 次物理步, 抓成一个 graph
@@ -444,6 +469,8 @@ class HumanoidEnv:
                 self.push_next[idx] = self._push_gap(idx.numel())
             self.push_next -= 1
         self.xfrc[:, self.torso_id, :2] = self.push_f * (self.push_left > 0)[:, None]
+        if self.getup:
+            self.xfrc[:, self.assist_id, 2] = self.assist * self.weight
         wp.capture_launch(self.graph)
         self.push_left = (self.push_left - 1).clamp(min=0)
         self.since_push += 1
@@ -597,6 +624,21 @@ class HumanoidEnv:
         obs, critic = self._obs()
         return obs, critic, r, terminated, truncated, info
 
+    def body_ground(self):
+        """起身用: 每个世界 [右手碰地, 左手碰地, 躯干碰地] [n, 3](手 = 手或前臂; 躯干 = 躯干、头、腰、胯、大腿、上臂)"""
+        g = self.c_geom.long().clamp(min=0)
+        valid = (self.c_idx < self.nacon[0]) & ((self.c_type & 1) != 0)
+        r0, r1 = self.geom_role[g[:, 0]], self.geom_role[g[:, 1]]
+        hit = valid & ((r0 == 3) | (r1 == 3)) & ~((r0 == 3) & (r1 == 3))
+        grp = torch.where(r0 == 3, self.geom_grp[g[:, 1]], self.geom_grp[g[:, 0]])
+        key = self.c_world.long().clamp(0, self.n - 1) * 4 + grp
+        cnt = torch.bincount(key, weights=hit.float(), minlength=self.n * 4).view(self.n, 4)
+        return cnt[:, :3] > 0
+
+    def hand_ground(self):
+        """每个世界手或前臂是否碰地 [n](测验用)"""
+        return self.body_ground()[:, :2].any(dim=1)
+
     def stood_up(self, g=None, fell=None):
         """站起来了: 躯干高度 > 站立的 90%、立直(倾斜 < 约 25°)、只有脚着地。起身策略交给走路策略也按它判(再加持续一段时间)。"""
         g = quat_to_gravity(self.qpos[:, 3:7]) if g is None else g
@@ -611,7 +653,22 @@ class HumanoidEnv:
         still = torch.exp(-(self.qvel[:, :2] ** 2).sum(dim=1) / 0.1)
         pose = torch.exp(-((self.qpos[:, self.qadr] - self.q_def) ** 2).sum(dim=1) / 1.0)
         self.m_stood = stood
-        r = rw["getup_height"] * z + rw["getup_up"] * up + rw["getup_stand"] * stood * 0.5 * (still + pose)
+        self.stood_sum, self.stood_cnt = self.stood_sum + stood.sum(), self.stood_cnt + self.n     # 不同步回 CPU, train.py 每轮读一次
+        r = rw["getup_height"] * z + rw["getup_up"] * up * z + rw["getup_stand"] * stood * 0.5 * (still + pose)
+        if rw["getup_effort"]:
+            self.m_effort = ((self.frc[:, self.dadr] / self.tau_max.to(self.dev)) ** 2).sum(dim=1)
+            r = r - rw["getup_effort"] * self.m_effort
+        if rw["getup_hand"]:
+            bg = self.body_ground()
+            # 只在躯干正在往上升时给, 按上升速度(0.5 m/s 封顶): 撑着不动拿不到(getup9 只要求"坐起来 + 手撑地", 趴着的学会撑起上身就不起来了)
+            self.m_hand = (self.qpos[:, 2] < GETUP_HAND_Z * self.root_z0) & bg[:, :2].any(dim=1)
+            r = r + rw["getup_hand"] * self.m_hand * bg[:, :2].float().mean(dim=1) * (self.qvel[:, 2].clamp(0, 0.5) / 0.5)
+        if rw["getup_air"]:
+            r = r - rw["getup_air"] * (~fell & (self.contact.sum(dim=1) == 0)).float()
+        if rw["getup_speed"]:
+            r = r - rw["getup_speed"] * (self.qvel[:, :3].norm(dim=1) - GETUP_MAX_V).clamp(min=0) ** 2
+        if rw["getup_spin"]:
+            r = r - rw["getup_spin"] * (self.qvel[:, 3:6].norm(dim=1) - GETUP_MAX_W).clamp(min=0) ** 2
         r = r - rw["action_rate"] * ((self.action - self.prev_action) ** 2).sum(dim=1)
         return r - rw["energy"] * (self.frc[:, self.dadr] * self.qvel[:, self.dadr]).abs().sum(dim=1)
 

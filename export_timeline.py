@@ -8,6 +8,8 @@
 输出 web/replays/tl_<名字>/: manifest.json(刚体、几何体、每个快照的轮数和每个世界的帧数) + 每个快照一个 it_XXXXX.bin。
 .bin 是小端二进制, 按世界依次放: 位置 int16(毫米)、朝向 int16(×32767, wxyz)、前进速度 int16(毫米/秒)、两脚接触 uint8。
 再跑一次时, 指令序列/世界数/步数没变的快照直接复用, 只跑新的。
+--walk runs/sp2/policy.pt: 链是起身策略时用, 每个快照和这个走路策略切换(combo.py), --lying 比例的人形从倒地开局, 每个快照的开局姿态相同:
+    python export_timeline.py runs/getup3 --name getup3 --walk runs/sp2/policy.pt --lying 1 --worlds 4 --steps 500 --seq "0:0,0,0,0.925,1; 5:0.6,0,0" --solo
 --solo: 回放列表只留这条时间线, 其他回放的文件移到 web/replays/archive/(不删), 列表项记在 archive/index.json, 放回去就能再看。
 """
 import argparse
@@ -22,6 +24,7 @@ import torch
 
 from env import HumanoidEnv
 from export import fixed_cmd, kinematics, model_info, parse_seq, rollout
+from combo import Switcher, combo_config
 from policy import env_config, load_actor
 
 POS_SCALE, QUAT_SCALE, VX_SCALE = 1000, 32767, 1000
@@ -67,6 +70,8 @@ if __name__ == "__main__":
     p.add_argument("--to", dest="it_to", type=int, default=10 ** 9)
     p.add_argument("--every", type=int, default=0, help="只取轮数是它倍数的快照; 0 = 全部")
     p.add_argument("--solo", action="store_true", help="回放列表只留这条时间线, 其他回放移到 web/replays/archive/")
+    p.add_argument("--walk", default="", help="链是起身策略时: 和这个走路策略切换")
+    p.add_argument("--lying", type=float, default=1.0, help="配合 --walk: 多大比例的人形从倒地开局")
     p.add_argument("--batch", type=int, default=32, help="一个环境里最多同时跑几个快照")
     a = p.parse_args()
 
@@ -82,6 +87,9 @@ if __name__ == "__main__":
     out_dir = os.path.join("web", "replays", f"tl_{a.name}")
     os.makedirs(out_dir, exist_ok=True)
     params = dict(seq=a.seq, push=a.push, cmd=a.cmd, gait=a.gait, worlds=a.worlds, steps=a.steps, hold_heading=a.hold_heading, seed=a.seed)
+    if a.walk:
+        params.update(walk=a.walk, lying=a.lying)
+        walk_s = torch.load(a.walk, map_location="cuda:0", weights_only=False)
     man_path = os.path.join(out_dir, "manifest.json")
     old = json.load(open(man_path, encoding="utf-8")) if os.path.exists(man_path) else {}
     reuse = {s["it"]: s for s in old.get("snaps", [])
@@ -98,15 +106,20 @@ if __name__ == "__main__":
         for b in range(0, len(mine), a.batch):
             part = mine[b:b + a.batch]
             states = [torch.load(f, map_location="cuda:0", weights_only=False) for _, _, f in part]
-            cfg = env_config(states[0], seed=a.seed, random_yaw=False, **fix)
+            K, S = a.worlds, len(part)
+            if a.walk:                                  # 起身策略的链: 每块世界用一个快照起身, 站起来后都交给同一个走路策略
+                cfg = combo_config(walk_s, states[0], seed=a.seed, random_yaw=False, getup_stand_frac=1 - a.lying, **fix)
+                env = HumanoidEnv(S * K, **cfg)
+                act = Switcher(env, walk_s, states, tile=True)
+            else:
+                cfg = env_config(states[0], seed=a.seed, random_yaw=False, **fix)
+                env = HumanoidEnv(S * K, **cfg)
+                acts = [load_actor(s, env) for s in states]
+
+                def act(obs):
+                    return torch.cat([f(obs[i * K:(i + 1) * K]) for i, f in enumerate(acts)])
             xml = xml or cfg.get("xml", "models/humanoid_pd.xml")
             assert cfg.get("xml", "models/humanoid_pd.xml") == xml, "链上各段的身体模型不一样, 不能放进同一条时间线"
-            K, S = a.worlds, len(part)
-            env = HumanoidEnv(S * K, **cfg)
-            acts = [load_actor(s, env) for s in states]
-
-            def act(obs):
-                return torch.cat([f(obs[i * K:(i + 1) * K]) for i, f in enumerate(acts)])
 
             q_hist, vx_hist, c_hist, end, fell = rollout(env, act, a.steps, seq, wz0, bool(a.gait), a.hold_heading, pushes)
             m, bodies, geoms = model_info(xml)
