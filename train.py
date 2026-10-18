@@ -63,6 +63,8 @@ p.add_argument("--assist-at", default="torso", help="辅助力拉哪个刚体: t
 p.add_argument("--effort-ramp", action="store_true", help="费力惩罚 getup_effort 跟着辅助力加: 权重 = 给定值 x (1 - 当前辅助力 / 起点)。从头就加满时策略学成躺着不动(getup11)")
 p.add_argument("--getup-classes", default="", help="起身开局只从姿态库的这些类别抽(逗号分隔: 0 仰躺 1 趴 2 侧躺 3 坐/跪 4 四肢着地), 例如 0,1,2,4")
 p.add_argument("--full-range", action="store_true", help="动作按关节各自裁到够得着整个活动范围(默认统一裁到 ±1.5, 膝盖最多弯 73°); 起身用")
+p.add_argument("--balls", action="store_true", help="开发球机: 每个世界隔一会儿从人周围扔一个躲避球(env.BALL_DEFAULT), 配合 --obs-add ball 和 --rw ball_hit=...,ball_near=...")
+p.add_argument("--ball", default="", help="覆盖发球机设置, 例如 speed=9:14,dist=5:8,every=1:3,head=0.5,spread=0.08,relax=0.7(范围用冒号)")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
 
@@ -89,6 +91,8 @@ env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy)
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
                gait_period=a.gait_period, cmd_stand=a.stand, cmd_turn=a.turn, cmd_acc=a.cmd_acc or None, cmd_ellipse=a.cmd_ellipse, cmd_grace=a.cmd_grace,
                push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
+               balls=(dict((k, tuple(float(x) for x in v.split(":")) if ":" in v else float(v)) for k, v in (kv.split("=") for kv in a.ball.split(",") if kv))
+                      if a.balls else None),
                getup=a.getup, getup_classes=[int(x) for x in a.getup_classes.split(',')] if a.getup_classes else None, act_clip="full" if a.full_range else 1.5, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
@@ -139,6 +143,11 @@ for _ in range(a.iters):
         if a.effort_ramp:
             env.rw["getup_effort"] = rw.get("getup_effort", 0.0) * (1 - env.assist / a.assist if a.assist else 1.0)
             m["effort_w"] = env.rw["getup_effort"]
+    if env.balls:                                                   # 这一轮扔了几个球、打中的比例
+        m["balls"] = float(env.ball_thrown_sum)
+        m["ball_hit"] = float(env.ball_hit_sum / env.ball_thrown_sum.clamp(min=1))
+        env.ball_thrown_sum.zero_()
+        env.ball_hit_sum.zero_()
     m["time"] = time.perf_counter() - t_start
     if writer is None:
         writer = csv.DictWriter(logf, fieldnames=list(m))
@@ -153,7 +162,8 @@ for _ in range(a.iters):
           f"vloss {m['vloss']:.3f} clip {m['clipfrac']:.2f}" + (f" | 不对称 {m['sym']:.4f}" if "sym" in m else "")
           + (f" | 越界 {m['bound']:.3f}" if "bound" in m else "")
           + (f" | 站着 {m['stood']:.2f} 辅助 {m['assist']:.3f}" if "stood" in m else "")
-          + (f" 费力权重 {m['effort_w']:.2f}" if "effort_w" in m else ""), flush=True)
+          + (f" 费力权重 {m['effort_w']:.2f}" if "effort_w" in m else "")
+          + (f" | 球 {m['balls']:.0f} 个 打中 {m['ball_hit'] * 100:4.1f}%" if "ball_hit" in m else ""), flush=True)
     if m["it"] % a.save_every == 0:
         save(os.path.join(a.out, "ckpt.pt"))
         save_policy(os.path.join(a.out, "policy.pt"))

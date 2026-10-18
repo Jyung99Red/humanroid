@@ -203,7 +203,7 @@ if __name__ == "__main__":
     ap.add_argument("--baseline", default="", help="基线 regress.json")
     ap.add_argument("--save", action="store_true", help="结果存到策略所在目录的 regress.json")
     a = ap.parse_args()
-    env, act, meta = load_policy(a.policy, 1024, random_yaw=False)
+    env, act, meta = load_policy(a.policy, 1024, random_yaw=False, balls=None)   # 练过躲球的策略: 测验时不扔球(不然躲球规划会改掉测验的指令)
     print(f"{a.policy}(第 {meta['iteration']} 轮)  指令范围 vx {env.cmd_rng[0]} wz {env.cmd_rng[2]} 步频 {env.gait_rng[0]} 着地 {env.gait_rng[1]}")
     res, rows = run_tracking(env, act)
     print("测验 1、2 明细:")

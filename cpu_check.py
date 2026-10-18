@@ -1,7 +1,7 @@
 """网页互动版的参考实现 + 可行性检查: 只用 export_web.py 导出的 web/play/policies.json, 在 MuJoCo 的 CPU 版(和浏览器里的 WebAssembly 同一套 C 代码)
 里跑走路 + 起身切换。训练用的是 GPU 版(MuJoCo Warp), 两者接触求解有细微差别, 策略要在这里也能用, 网页才有戏。
 web/play/sim.js 是这里 Controller 的逐行翻译; --dump 存一段轨迹(观测、动作)给 node 端对比。
-发球机的球(web/play/balls.json)也在这里: add_balls 往场景里加一池自由刚体, Controller.throw_ball 扔, aim 算出手速度。
+发球机的球(web/play/balls.json): balls.add_balls 往场景里加一池自由刚体, Controller.throw_ball 扔, balls.aim 算出手速度。
 
     python cpu_check.py                    # 几个场景各跑若干次: 站、走(前/后/侧)、被推倒再起来、从倒地姿态起身
     python cpu_check.py --balls            # 发球机: 每种球打躯干/头, 命中率和被打倒的比例
@@ -11,12 +11,13 @@ import argparse
 import base64
 import json
 import math
-import re
 import time
 
 import mujoco
 import numpy as np
 import torch
+
+from balls import BALL_NEAR, BODY_R, CLOSE_T, DODGE_ACC, DODGE_HOLD, add_balls, aim, closest_approach
 
 
 def f32(s):
@@ -49,68 +50,6 @@ def rotate_inverse(q, v):
     return v - w * t + np.cross(u, t)
 
 
-def add_balls(xml, spec):
-    """往场景里加一池球: 每种 per_kind 个自由刚体, 排在人形后面(人形的刚体编号、qpos 地址都不变)。
-    不用的球停在高空(gravcomp=1 抵消重力, 碰不到任何东西), 扔的时候才放下来。关键帧的 qpos 长度会对不上, 删掉(没用到)。"""
-    xml = re.sub(r"<keyframe>.*?</keyframe>", "", xml, flags=re.S)
-    fr = " ".join(str(v) for v in spec["friction"])
-    px, py, pz = spec["park"]
-    bodies, k = [], 0
-    for kd in spec["kinds"]:
-        for j in range(spec["per_kind"]):
-            bodies.append(f'<body name="ball_{kd["id"]}_{j}" pos="{px + 1.5 * k} {py} {pz}" gravcomp="1"><freejoint/>'
-                          f'<geom type="sphere" size="{kd["r"]}" mass="{kd["mass"]}" shellinertia="{str(kd["shell"]).lower()}" '
-                          f'priority="1" condim="6" friction="{fr}" solref="{kd["solref"][0]} {kd["solref"][1]}"/></body>')
-            k += 1
-    return xml.replace("</worldbody>", "".join(bodies) + "</worldbody>")
-
-
-def aim(src, dst, speed, drag, dt, dec, g):
-    """从 src 以 speed 扔到 dst(世界系)要的出手速度, 低弹道, 算上空气阻力 drag = 阻力系数 / 质量(加速度 = -drag |v| v)。
-    和 MuJoCo 里一样离散积分(阻力每个策略步算一次, 物理步半隐式欧拉)。返回 (速度, 飞行时间, 打得到吗); 打不到时给打得最高的角度"""
-    dx, dy = dst[0] - src[0], dst[1] - src[1]
-    dist = math.hypot(dx, dy)
-    ex, ey = (dx / dist, dy / dist) if dist > 1e-6 else (1.0, 0.0)
-    h = dt / dec
-
-    def fly(th):                                       # 飞到水平距离 dist 时的 (高度, 时间); 飞不到返回 None
-        vs, vz, s, z, t = speed * math.cos(th), speed * math.sin(th), 0.0, src[2], 0.0
-        while t < 3 and z > -1:
-            v = math.hypot(vs, vz)
-            a_s, a_z = -drag * v * vs, -drag * v * vz - g
-            for _ in range(dec):
-                s0, z0 = s, z
-                vs += h * a_s
-                vz += h * a_z
-                s += h * vs
-                z += h * vz
-                t += h
-                if s >= dist:
-                    f = (dist - s0) / (s - s0)
-                    return z0 + f * (z - z0), t - h * (1 - f)
-        return None
-
-    def err(th):
-        r = fly(th)
-        return -1e9 if r is None else r[0] - dst[2]
-
-    ths = [math.radians(a) for a in range(-40, 62, 2)]
-    es = [err(th) for th in ths]
-    reach = any(e >= 0 for e in es)
-    if reach:                                          # 第一个打高了的角度和前一个之间二分
-        i = next(i for i, e in enumerate(es) if e >= 0)
-        lo, hi = (ths[i - 1], ths[i]) if i > 0 else (ths[0], ths[0])
-        for _ in range(20):
-            mid = (lo + hi) / 2
-            lo, hi = (lo, mid) if err(mid) >= 0 else (mid, hi)
-        th = hi
-    else:
-        th = ths[max(range(len(ths)), key=lambda i: es[i])]
-    r = fly(th)
-    c = speed * math.cos(th)
-    return np.array([c * ex, c * ey, speed * math.sin(th)]), (r[1] if r else 3.0), reach
-
-
 class Controller:
     """一个人形: 物理(MuJoCo CPU) + 走路/起身两个策略按状态切换。和 combo.Switcher + env.HumanoidEnv.step 一致。"""
 
@@ -126,9 +65,11 @@ class Controller:
                 for _ in range(balls["per_kind"]):
                     b = self.m.nbody - n + len(self.balls)
                     jnt = self.m.body_jntadr[b]
-                    self.balls.append(dict(kind=kind, body=b, qadr=int(self.m.jnt_qposadr[jnt]), dadr=int(self.m.jnt_dofadr[jnt]),
+                    self.balls.append(dict(kind=kind, body=b, qadr=int(self.m.jnt_qposadr[jnt]), dadr=int(self.m.jnt_dofadr[jnt]), r=kd["r"],
                                            drag=0.5 * balls["air"]["rho"] * balls["air"]["cd"] * math.pi * kd["r"] ** 2 / kd["mass"]))
         self.nbh = self.m.nbody - len(self.balls)          # 人形(含 world)的刚体数, 球的刚体编号从这里开始
+        self.head_id, self.pelvis_id = (mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, n) for n in ("head", "pelvis"))
+        self.dodge = bool(cfg.get("dodge"))                # 躲球规划(env._steer): 走路策略是带着它练的(export_web.py 导出)
         self.ball_state = np.zeros(len(self.balls), dtype=int)   # 0 停在高空, 1 飞行中(还没碰到东西), 2 碰过了
         self.ball_seq = np.full(len(self.balls), -1)       # 第几个扔出去的(回收最早的那个)
         self.walk, self.getup = Net(cfg["walk"]), Net(cfg["getup"])
@@ -156,6 +97,7 @@ class Controller:
         for i in range(len(self.balls)):
             self.park_ball(i)
         self.n_thrown, self.hits = 0, []                   # hits: 球打到人的记录 (球, 刚体, 位置), 调用方取走
+        self.dodge_on, self.dodge_dir, self.ball_after, self._ended = False, np.zeros(2), 10 ** 6, False
         self.d.ctrl[:] = self.q_def
         mujoco.mj_forward(self.m, self.d)
         self.action = np.zeros(self.m.nu)
@@ -205,6 +147,7 @@ class Controller:
                 i = b - self.nbh
                 if i >= 0 and self.ball_state[i] == 1 and o < self.nbh:
                     self.ball_state[i] = 2
+                    self._ended = True
                     if o > 0:
                         self.hits.append((i, int(o), con.pos.copy()))
 
@@ -228,13 +171,67 @@ class Controller:
                 fell = True
         return fell, feet
 
+    def _threat(self):
+        """飞行中的球里预测空隙最小的那个(训练时每个世界只有一个球): (空隙, 几秒后最近, 位置, 速度); 没有飞行中的球返回 None"""
+        d = self.d
+        live = [i for i in range(len(self.balls)) if self.ball_state[i] == 1]
+        if not live:
+            return None
+        pts = d.xpos[[self.head_id, self.c["torso_body"], self.pelvis_id]][None]
+        vb = np.array([[d.qvel[0], d.qvel[1], 0.0]])
+        best = None
+        for i in live:
+            b = self.balls[i]
+            p, v = d.qpos[b["qadr"]:b["qadr"] + 3].copy(), d.qvel[b["dadr"]:b["dadr"] + 3].copy()
+            clear, tc = closest_approach(p[None], v[None], pts, vb, -self.m.opt.gravity[2], BODY_R + b["r"])
+            if best is None or clear[0] < best[0]:
+                best = (clear[0], tc[0], p, v)
+        return best
+
+    def ball_obs(self):
+        """球的观测块(同 env._ball_obs); 没有飞行中的球就全 0"""
+        d, th = self.d, self._threat()
+        if th is None:
+            return np.zeros(9)
+        clear, tc, p, v = th
+        q = d.qpos[3:7]
+        yaw = math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2))
+        c, s = math.cos(yaw), math.sin(yaw)
+        hf = lambda x: np.array([c * x[0] + s * x[1], -s * x[0] + c * x[1], x[2]])
+        rel = p - d.xpos[self.c["torso_body"]]
+        return np.concatenate([hf(rel) / 5, hf(v) / 10, [tc / CLOSE_T, min(max(clear, -0.3), 2.0), 1.0]])
+
+    def _steer(self):
+        """手写的躲球规划(同 env._steer): 来球预测会打到时速度指令换成"往远离球路的方向全速走", 球结束后 DODGE_HOLD 秒放手"""
+        d, c, th = self.d, self.c, self._threat()
+        live = th is not None
+        if live and th[0] < BALL_NEAR and not self.dodge_on:
+            _, tc, p, v = th
+            bp = p + v * tc + 0.5 * self.m.opt.gravity * tc * tc
+            away = d.xpos[c["torso_body"], :2] + d.qvel[:2] * tc - bp[:2]
+            self.dodge_dir = away / max(np.linalg.norm(away), 1e-6)
+            self.dodge_on = True
+        self.dodge_on = self.dodge_on and (live or self.ball_after * self.dt < DODGE_HOLD)
+        if not self.dodge_on:
+            return
+        q = d.qpos[3:7]
+        yaw = math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2))
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        hx, hy = cy * self.dodge_dir[0] + sy * self.dodge_dir[1], -sy * self.dodge_dir[0] + cy * self.dodge_dir[1]
+        R = c["cmd_range"]
+        ax, ay = (R["vx"][1] if hx >= 0 else -R["vx"][0]), (R["vy"][1] if hy >= 0 else -R["vy"][0])
+        k = 1 / max(math.sqrt((hx / ax) ** 2 + (hy / ay) ** 2), 1e-6)
+        s = DODGE_ACC * self.dt
+        self.cmd += np.clip(np.array([hx * k, hy * k, 0.0]) - self.cmd, -s, s)
+        self.gait[1] = c["gait_walk"][1]                   # 站定的也要迈步
+
     def obs(self, layout, last_action):
         d = self.d
         q = d.qpos[3:7]
         blocks = dict(gravity=lambda: gravity(q), lin_vel=lambda: rotate_inverse(q, d.qvel[:3]) * 2.0, ang_vel=lambda: d.qvel[3:6] * 0.25,
                       joint_pos=lambda: d.qpos[self.qadr], joint_vel=lambda: d.qvel[self.dadr] * 0.05, last_action=lambda: last_action,
                       cmd=lambda: self.cmd, clock=lambda: np.array([math.sin(2 * math.pi * self.phase), math.cos(2 * math.pi * self.phase)]),
-                      gait=lambda: self.gait)
+                      gait=lambda: self.gait, ball=self.ball_obs)
         return np.concatenate([blocks[n]() for n, _ in layout])
 
     def step(self):
@@ -261,21 +258,26 @@ class Controller:
             if self.ball_state[i]:
                 v = d.qvel[b["dadr"]:b["dadr"] + 3]
                 d.xfrc_applied[b["body"], :3] = -b["drag"] * self.m.body_mass[b["body"]] * math.sqrt(v @ v) * v
+        self._ended = False
         for _ in range(c["decimation"]):
             mujoco.mj_step(self.m, d)
             if (self.ball_state == 1).any():
                 self._ball_contacts()
+        self.ball_after = 0 if self._ended else self.ball_after + 1
         self.push_left = max(0, self.push_left - 1)
         self.phase = (self.phase + self.dt * self.gait[0]) % 1.0
         if c["cmd_acc"]:                                   # 同 env._ramp_cmd
             s = c["cmd_acc"] * self.dt
-            self.cmd += np.clip(self.cmd_goal - self.cmd, -s, s)
+            if not self.dodge_on:                          # 躲球规划接管着时不动(由 _steer 管)
+                self.cmd += np.clip(self.cmd_goal - self.cmd, -s, s)
             moving = np.abs(self.cmd).sum() > 1e-6
             self.gait[0] = self.gait_goal[0]
             if not (self.gait_goal[1] >= 1 and moving and self.gait[1] < 1):
                 self.gait[1] = self.gait_goal[1]
         else:
             self.cmd[:], self.gait[:] = self.cmd_goal, self.gait_goal
+        if self.dodge:
+            self._steer()
         return o, a
 
 

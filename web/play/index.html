@@ -90,7 +90,7 @@
     </div>
     <div class="row"><span class="k2">瞄准</span><div class="seg" id="aimseg"><button data-v="head">头</button><button data-v="torso" class="on">躯干</button><button data-v="legs">腿</button><button data-v="rand">随机</button></div></div>
     <div class="row"><span class="k2">位置</span><div class="seg" id="posseg"><button data-v="far" class="on">镜头对面</button><button data-v="side">侧面</button><button data-v="rand">四面八方</button></div></div>
-    <div class="checks"><label><input type="checkbox" id="lead" checked> 提前量</label><label><input type="checkbox" id="showpath" checked> 显示弹道</label></div>
+    <div class="checks"><label><input type="checkbox" id="lead" checked> 提前量</label><label><input type="checkbox" id="showpath" checked> 显示弹道</label><label id="dodgewrap" hidden><input type="checkbox" id="dodge" checked> 让它躲</label></div>
     <div id="gstat"><span><span class="k">发出</span> <b id="nthrown">0</b></span><span><span class="k">命中</span> <b id="nhit">0</b></span><span><span class="k">没打中</span> <b id="nmiss">0</b></span><span><span class="k">打倒</span> <b id="nknock">0</b></span></div>
     <div id="hitmsg">球落地前直接打到人才算命中</div>
   </div>
@@ -462,6 +462,10 @@ seg('aimseg', 'aim', () => { gun.part = pickPart(); });
 seg('posseg', 'pos', () => { if (gun.pos === 'rand') gun.phiGoal = Math.random() * 2 * Math.PI; });
 for (const [id, unit] of [['bspeed', ' m/s'], ['bdist', ' m'], ['bint', ' s'], ['bspread', ' cm']]) $(id).oninput = (e) => { $(id + 'v').textContent = e.target.value + unit; };
 $('fire').onclick = fire;
+if (ctl.dodge) {                                         // 走路策略是带着躲球规划练的: 可以关掉对比(关了就只按你的按键走)
+  $('dodgewrap').hidden = false;
+  $('dodge').onchange = (e) => { ctl.dodge = e.target.checked; if (!ctl.dodge) ctl.dodgeOn = false; };
+}
 $('auto').onclick = () => setAuto(!gun.auto);
 $('reset').onclick = () => {
   ctl.resetStanding(); snapshot();
@@ -557,7 +561,7 @@ function tick(now) {
   ground.position.set(Math.round(controls.target.x / 4) * 4, 0, Math.round(controls.target.z / 4) * 4);
   sun.position.set(controls.target.x + 7, 14, controls.target.z + 5); sun.target.position.copy(controls.target);
   // 状态栏
-  $('mode').textContent = ctl.mode === 0 ? '走路策略' : '起身策略(爬起来中)';
+  $('mode').textContent = ctl.mode === 0 ? (ctl.dodgeOn ? '走路策略 · 躲球中' : '走路策略') : '起身策略(爬起来中)';
   $('mode').className = ctl.mode === 0 ? '' : 'getup';
   const c = ctl.cmdGoal;
   $('cmd').textContent = Math.abs(c[0]) + Math.abs(c[1]) + Math.abs(c[2]) < 1e-6 ? '站定'

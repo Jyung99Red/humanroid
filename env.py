@@ -21,6 +21,8 @@ import numpy as np
 import torch
 import warp as wp
 
+from balls import BALL_NEAR, BODY_R, CLOSE_T, DODGE_ACC, DODGE_HOLD, AimTable, add_balls, closest_approach, drag_coef
+
 wp.config.quiet = True
 
 # 奖励权重(正数是奖励, 惩罚项在代码里取负)
@@ -57,6 +59,9 @@ REWARD = dict(
                        # knee_swing 按时钟算, 着地比例大时摆动窗口短, 等于奖励提前抬脚(knee3 不管指令多少都在时钟 0.6 抬脚)。例如 2.0
     stand_feet=0.0,    # 指令是站定(着地比例 1)、又不在被推后 PUSH_GRACE 秒内时, 哪只脚离地罚哪只(两只都离地罚满 1)。
                        # 开了随机推搡后策略学会"一直原地踏步"(随时准备跨步, 不容易被推倒), clock 压不住。例如 2.0
+    ball_hit=0.0,      # 被球打中(落地之前直接碰到身体)扣一次。只在开了发球机(balls)时有意义, 例如 8.0
+    ball_near=0.0,     # 来球的预测空隙(balls.closest_approach: 抛物线和头/躯干/胯最近时的距离减去粗细)小于 BALL_NEAR 时每步扣, 空隙 <= 0 扣满。
+                       # 给"往哪边躲"一个连续的梯度, 不用等真打中。例如 0.2
     knee_lock=0.0,     # 膝盖弯得少于 KNEE_MIN_DEG 就罚(伸直锁死时罚满 1)。不加时 human50 的策略把膝盖顶在伸直限位上直腿走, 例如 1.0
     # 起身模式(getup=True)只用下面这几项 + energy、action_rate, 其他走路的项不算
     getup_height=1.0,  # 躯干高度 / 站立高度(封顶 1)
@@ -89,6 +94,14 @@ GETUP_WIDTH_MAX = 0.35    # 米, 起身时两脚左右间距上限(真人从蹲�
 GETUP_MAX_V = 1.0         # m/s, 起身时躯干速度上限(超过才罚)
 GETUP_MAX_W = 4.0         # rad/s, 起身时躯干角速度上限
 PUSH_GRACE = 1.0          # 秒, 被推之后多久内不按步态时钟奖励节奏
+# 发球机(balls): 每个世界一个球, 隔一会儿从人周围随机方位扔一个, 瞄准头或躯干(打提前量)
+BALL_DEFAULT = dict(spec="web/play/balls.json", kind="dodge", speed=(9.0, 14.0), dist=(5.0, 8.0), muzzle=(0.9, 1.5), every=(1.0, 3.0),
+                    head=0.5, spread=0.08, relax=0.7, steer=0)   # 速度 m/s、离人距离 m、出手高度 m、两个球之间隔几秒、打头的比例、瞄准点散布 m、来球时速度跟踪打几折、
+                                                        # steer=1: 手写的躲球规划接管速度指令(见 _steer)
+BALL_GRACE = 0.5          # 秒, 球结束(碰到人或地)以后还放宽这么久: 躲完了慢慢回到指令
+BALL_PARK_AFTER = 0.3     # 秒, 球碰到东西以后过这么久收回高空(不然滚到脚下会绊倒)
+BALL_MAX_FLIGHT = 3.0     # 秒, 一直没碰到东西也收回
+HIT_DV = 0.15             # m/s, 球这一步的速度和"只有重力 + 阻力"的预测差这么多 = 碰到东西了(离地高就是打到人, 贴地就是落地)
 TRACK_FINE = 0.05         # 窄跟踪项的误差尺度: exp(-误差^2 / 0.05), 即 sigma 约 0.22(宽的那两项是 0.25, sigma 0.5)
 WALK_V = 0.3              # m/s, 前进(倒退)指令到这个速度, 脚的姿态规则完全按往前走(倒退)算; 速度指令为 0 时按站定算
 
@@ -170,6 +183,7 @@ OBS_BLOCKS = dict(
     gravity="重力方向(机体系)", lin_vel="线速度(机体系, x2)", ang_vel="角速度(机体系, x0.25)", joint_pos="关节角",
     joint_vel="关节速度(x0.05)", last_action="上一步动作", cmd="速度指令 vx,vy,wz", clock="步态时钟 sin/cos", gait="步态指令 步频,着地比例",
     height="躯干高度", foot_contact="两只脚是否着地", push="正在推躯干的力(机体系, /100 N; 只给评论家用)",
+    ball="来球(发球机): 相对躯干的位置、速度(朝向坐标系)、几秒后最近、预测空隙、是否有来球",
 )
 DEFAULT_OBS = ("gravity", "lin_vel", "ang_vel", "joint_pos", "joint_vel", "last_action", "cmd", "clock")
 DEFAULT_PRIV = ("height", "foot_contact")          # 只给评论家(训练时的特权信息)
@@ -181,7 +195,7 @@ class HumanoidEnv:
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
                  arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None,
                  push_force=0.0, push_period=(100, 250), push_len=10, cmd_turn=0.0, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1, getup_classes=None,
-                 cmd_ellipse=False, cmd_grace=0.0):
+                 cmd_ellipse=False, cmd_grace=0.0, balls=None):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -205,7 +219,16 @@ class HumanoidEnv:
         torch.manual_seed(seed)
         wp.init()
 
-        self.mjm = mjm = mujoco.MjModel.from_xml_path(xml)
+        # 发球机: 场景里加一个球(排在人形后面, 人形的刚体编号和 qpos 地址不变)。balls = BALL_DEFAULT 的覆盖项; None = 不扔球
+        self.balls = dict(BALL_DEFAULT, **balls) if balls is not None else None
+        if self.balls:
+            assert not getup, "起身模式不扔球"
+            spec = json.load(open(self.balls["spec"], encoding="utf-8"))
+            kd = next(k for k in spec["kinds"] if k["id"] == self.balls["kind"])
+            self.ball_r, self.ball_drag = kd["r"], drag_coef(spec, kd)
+            self.mjm = mjm = mujoco.MjModel.from_xml_string(add_balls(open(xml, encoding="utf-8").read(), dict(spec, per_kind=1, kinds=[kd])))
+        else:
+            self.mjm = mjm = mujoco.MjModel.from_xml_path(xml)
         self.dt = mjm.opt.timestep * decimation          # 一个策略步的时间
         self.nu = mjm.nu
         # 执行器顺序 != qpos 顺序, 建立映射
@@ -280,6 +303,9 @@ class HumanoidEnv:
         wp.set_device("cuda:0")
         self.m = mjw.put_model(mjm)
         self.m.opt.warn_overflow = 0
+        if self.balls:                                     # 抵消重力的开关每个世界一份: 停着的球 1(停在高空), 扔出去的 0
+            self.m.body_gravcomp = wp.array(np.tile(mjm.body_gravcomp, (nworld, 1)).astype(np.float32), dtype=float)
+            self.gravc = wp.to_torch(self.m.body_gravcomp)
         self.d = mjw.make_data(mjm, nworld=nworld, nconmax=nconmax, njmax=njmax)
         self.qpos, self.qvel = wp.to_torch(self.d.qpos), wp.to_torch(self.d.qvel)
         self.ctrl, self.warm = wp.to_torch(self.d.ctrl), wp.to_torch(self.d.qacc_warmstart)
@@ -309,6 +335,9 @@ class HumanoidEnv:
                 role[g] = 3
             elif body in ("foot_right", "foot_left"):
                 role[g] = 0 if body == "foot_right" else 1
+        if self.balls:                                     # 4 = 球: 球碰地不算摔倒, 也不算脚着地
+            self.ball_body = mjm.nbody - 1
+            role[mjm.body_geomadr[self.ball_body]] = 4
         self.geom_role = role.to(self.dev)
         # 起身用的接触分组: 0 右手(手 + 前臂), 1 左手, 2 躯干(躯干、头、腰、胯、大腿、上臂), 3 其他(脚、小腿、地面)
         grp = []
@@ -318,6 +347,26 @@ class HumanoidEnv:
                        else 2 if b in ("torso", "head", "waist_lower", "pelvis") or b.startswith(("thigh", "upper_arm")) else 3)
         self.geom_grp = torch.tensor(grp, dtype=torch.long, device=self.dev)
 
+        if self.balls:
+            b = self.ball_body
+            jnt = mjm.body_jntadr[b]
+            self.ball_qa, self.ball_da = int(mjm.jnt_qposadr[jnt]), int(mjm.jnt_dofadr[jnt])
+            self.ball_mass = float(mjm.body_mass[b])
+            self.ball_park = torch.tensor(mjm.qpos0[self.ball_qa:self.ball_qa + 7], dtype=torch.float32, device=self.dev)
+            self.gvec = torch.tensor(mjm.opt.gravity, dtype=torch.float32, device=self.dev)
+            lng = dict(dtype=torch.long, device=self.dev)
+            self.ball_state = torch.zeros(nworld, **lng)    # 0 停在高空, 1 飞行中(还没碰到东西), 2 碰到东西了(过一会儿收回)
+            self.ball_t = torch.zeros(nworld, **lng)        # 飞行中: 扔出后几步; 碰到以后: 碰到后几步
+            self.ball_next = torch.zeros(nworld, **lng)     # 停着时: 离下一次扔还有几步
+            self.ball_after = torch.full((nworld,), 10 ** 6, **lng)   # 上一个球碰到东西以来过了几步(BALL_GRACE 用)
+            self.ball_v0 = torch.zeros(nworld, 3, device=self.dev)    # 这一步物理之前球的速度, 和这一步的加速度(重力 + 阻力): 判碰撞用
+            self.ball_acc = torch.zeros(nworld, 3, device=self.dev)
+            self.ball_hit = torch.zeros(nworld, dtype=torch.bool, device=self.dev)   # 这一步刚被打中
+            self.dodge_on = torch.zeros(nworld, dtype=torch.bool, device=self.dev)   # 躲球规划正在接管指令
+            self.dodge_dir = torch.zeros(nworld, 2, device=self.dev)                 # 起躲时定下的方向(世界系水平单位向量)
+            self.ball_thrown_sum = torch.zeros((), device=self.dev)   # 扔了几个、打中几个(train.py 每轮读一次再清零, 不同步回 CPU)
+            self.ball_hit_sum = torch.zeros((), device=self.dev)
+            self.aim_tab = AimTable(self.ball_drag, self.dt, decimation, float(-mjm.opt.gravity[2]), self.dev)
         mjw.step(self.m, self.d)                           # 热身, 编译 kernel
         with wp.ScopedCapture() as cap:                    # 一个策略步 = decimation 次物理步, 抓成一个 graph
             for _ in range(decimation):
@@ -386,8 +435,138 @@ class HumanoidEnv:
         self.phase[idx] = torch.rand(k, **f)
         self.push_f[idx], self.push_left[idx], self.since_push[idx] = 0, 0, 10 ** 6
         self.push_next[idx] = self._push_gap(k)
+        if self.balls:
+            self._park_balls(idx)
+            self.ball_after[idx] = 10 ** 6
+            self.dodge_on[idx] = False
         if not fresh:
             self.t[idx] = 0
+
+    # ---------------- 发球机 ----------------
+    def _park_balls(self, idx):
+        """把 idx 这些世界的球收回高空, 排好下一次什么时候扔"""
+        qa, da, b = self.ball_qa, self.ball_da, self.ball_body
+        self.qpos[idx, qa:qa + 7] = self.ball_park
+        self.qvel[idx, da:da + 6] = 0
+        self.xfrc[idx, b] = 0
+        self.gravc[idx, b] = 1.0
+        self.ball_state[idx], self.ball_t[idx] = 0, 0
+        lo, hi = self.balls["every"]
+        self.ball_next[idx] = ((lo + (hi - lo) * torch.rand(idx.numel(), device=self.dev)) / self.dt).long().clamp(min=1)
+
+    def throw(self, idx, speed=None, dist=None, ang=None, head=None):
+        """从 idx 这些世界的人周围扔一个球: 方位、距离、速度、打头还是躯干都随机(给了就用给的, [k] 张量), 瞄准点加散布, 按躯干现在的水平速度打提前量"""
+        k, f = idx.numel(), dict(device=self.dev, dtype=torch.float32)
+        B = self.balls
+        U = lambda r: r[0] + (r[1] - r[0]) * torch.rand(k, **f)
+        speed = U(B["speed"]) if speed is None else speed
+        dist = U(B["dist"]) if dist is None else dist
+        ang = torch.rand(k, **f) * 2 * math.pi if ang is None else ang
+        head = torch.rand(k, device=self.dev) < B["head"] if head is None else head
+        part = torch.where(head, self.head_id, self.torso_id)
+        tgt = self.xpos[idx, part] + torch.randn(k, 3, **f) * B["spread"]
+        torso = self.xpos[idx, self.torso_id]
+        src = torch.stack([torso[:, 0] + dist * torch.cos(ang), torso[:, 1] + dist * torch.sin(ang), U(B["muzzle"])], 1)
+        lead = torch.cat([self.qvel[idx, :2], torch.zeros(k, 1, **f)], 1)
+        dst = tgt
+        for _ in range(2):                                 # 提前量: 飞行时间和落点互相依赖
+            vel, t, _ = self.aim_tab(src, dst, speed)
+            dst = tgt + lead * t[:, None]
+        qa, da, b = self.ball_qa, self.ball_da, self.ball_body
+        self.qpos[idx, qa:qa + 7] = torch.cat([src, torch.tensor([1.0, 0, 0, 0], **f).expand(k, 4)], 1)
+        self.qvel[idx, da:da + 6] = torch.cat([vel, torch.randn(k, 3, **f) * 3], 1)
+        self.gravc[idx, b] = 0.0
+        self.ball_state[idx], self.ball_t[idx] = 1, 0
+        self.ball_thrown_sum += k
+
+    def _ball_pre(self):
+        """物理步之前: 碰过东西的球过一会儿收回、到点的扔出去、加空气阻力(每个策略步算一次, 同网页)"""
+        st, dt = self.ball_state, self.dt
+        old = ((st == 2) & (self.ball_t * dt >= BALL_PARK_AFTER)) | ((st == 1) & (self.ball_t * dt >= BALL_MAX_FLIGHT))
+        idx = old.nonzero(as_tuple=False).squeeze(1)
+        if idx.numel():
+            self._park_balls(idx)
+        self.ball_next -= (self.ball_state == 0).long()
+        idx = ((self.ball_state == 0) & (self.ball_next <= 0)).nonzero(as_tuple=False).squeeze(1)
+        if idx.numel():
+            self.throw(idx)
+        da, b = self.ball_da, self.ball_body
+        v = self.qvel[:, da:da + 3]
+        on = (self.ball_state != 0).float()[:, None]
+        drag = -self.ball_drag * self.ball_mass * v.norm(dim=1, keepdim=True) * v * on
+        self.xfrc[:, b, :3] = drag
+        self.ball_v0 = v.clone()
+        self.ball_acc = (drag / self.ball_mass + self.gvec) * on
+
+    def _ball_post(self):
+        """物理步之后: 飞行中的球速度突变 = 碰到东西了。离地高 = 打到人(躲避球规则: 落过地的不算), 贴地 = 落地"""
+        qa, da = self.ball_qa, self.ball_da
+        st = self.ball_state
+        live = st == 1
+        jump = (self.qvel[:, da:da + 3] - (self.ball_v0 + self.ball_acc * self.dt)).norm(dim=1) > HIT_DV
+        low = self.qpos[:, qa + 2] < self.ball_r + 0.03
+        self.ball_hit = live & jump & ~low
+        end = live & jump
+        self.ball_state = torch.where(end, 2, st)
+        self.ball_t = torch.where(end, 0, self.ball_t + (st != 0).long())
+        self.ball_after = torch.where(end, 0, self.ball_after + 1)
+        self.ball_hit_sum += self.ball_hit.sum()
+
+    def _ball_predict(self):
+        """飞行中的球: (预测空隙 [n], 几秒后最近 [n], 是否飞行中 [n])"""
+        qa, da = self.ball_qa, self.ball_da
+        pts = self.xpos[:, [self.head_id, self.torso_id, self.pelvis_id]]
+        vb = torch.cat([self.qvel[:, :2], torch.zeros_like(self.qvel[:, :1])], 1)
+        clear, tc = closest_approach(self.qpos[:, qa:qa + 3], self.qvel[:, da:da + 3], pts, vb, float(-self.gvec[2]), BODY_R + self.ball_r)
+        return clear, tc, self.ball_state == 1
+
+    def _steer(self):
+        """手写的躲球规划: 来球预测会打到(空隙 < BALL_NEAR)时, 速度指令按 DODGE_ACC 变成"往远离球路的方向全速走"(这个方向上按椭圆取最大速度,
+        方向在起躲时定下: 球在最近时刻的位置 -> 躯干那时的位置(按现在的水平速度推)); 球结束后再保持 DODGE_HOLD 秒, 然后按加速度限制回到原来的指令。
+        网页 / cpu_check 的 Controller 里是同一套(那边可能同时有几个球, 取最危险的那个)"""
+        assert self.cmd_acc is not None, "躲球规划要配指令加速度限制(结束后靠它回到原指令)"
+        qa, da = self.ball_qa, self.ball_da
+        clear, tc, live = self._ball_predict()
+        start = live & (clear < BALL_NEAR) & ~self.dodge_on
+        if start.any():
+            p, v = self.qpos[:, qa:qa + 3], self.qvel[:, da:da + 3]
+            bp = p + v * tc[:, None] + 0.5 * self.gvec * (tc * tc)[:, None]
+            away = self.xpos[:, self.torso_id, :2] + self.qvel[:, :2] * tc[:, None] - bp[:, :2]
+            away = away / away.norm(dim=1, keepdim=True).clamp(min=1e-6)
+            self.dodge_dir = torch.where(start[:, None], away, self.dodge_dir)
+        self.dodge_on = (self.dodge_on | start) & (live | (self.ball_after.float() * self.dt < DODGE_HOLD))
+        q = self.qpos[:, 3:7]
+        yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        hx, hy = c * self.dodge_dir[:, 0] + s * self.dodge_dir[:, 1], -s * self.dodge_dir[:, 0] + c * self.dodge_dir[:, 1]
+        (xlo, xhi), (ylo, yhi) = self.cmd_rng[0], self.cmd_rng[1]
+        ax = torch.where(hx >= 0, torch.full_like(hx, xhi), torch.full_like(hx, -xlo)).clamp(min=1e-6)
+        ay = torch.where(hy >= 0, torch.full_like(hy, yhi), torch.full_like(hy, -ylo)).clamp(min=1e-6)
+        k = 1 / ((hx / ax) ** 2 + (hy / ay) ** 2).sqrt().clamp(min=1e-6)
+        esc = torch.stack([hx * k, hy * k, torch.zeros_like(hx)], 1)
+        on = self.dodge_on[:, None]
+        step = DODGE_ACC * self.dt
+        self.cmd = torch.where(on, self.cmd + (esc - self.cmd).clamp(-step, step), self.cmd)
+        self.gait[:, 1] = torch.where(self.dodge_on, sum(self.gait_rng[1]) / 2, self.gait[:, 1])   # 站定的也要迈步
+
+    def _ball_grace(self):
+        """来球时、和球结束后 BALL_GRACE 秒内为 1"""
+        return ((self.ball_state == 1) | (self.ball_after.float() * self.dt < BALL_GRACE)).float()
+
+    def _ball_obs(self):
+        """球的观测块(9): 来球相对躯干的位置(朝向坐标系, /5)、速度(朝向坐标系, /10)、几秒后最近(/CLOSE_T)、预测空隙(米, 裁到 -0.3~2)、是否有来球。
+        没有来球(停着或已经碰到东西)时全是 0"""
+        if not self.balls:
+            return torch.zeros(self.n, 9, device=self.dev)
+        qa, da = self.ball_qa, self.ball_da
+        q = self.qpos[:, 3:7]
+        yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+        c, s = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
+        hf = lambda v: torch.cat([c * v[:, :1] + s * v[:, 1:2], -s * v[:, :1] + c * v[:, 1:2], v[:, 2:3]], 1)
+        clear, tc, live = self._ball_predict()
+        o = torch.cat([hf(self.qpos[:, qa:qa + 3] - self.xpos[:, self.torso_id]) / 5, hf(self.qvel[:, da:da + 3]) / 10,
+                       (tc / CLOSE_T)[:, None], clear.clamp(-0.3, 2.0)[:, None], torch.ones_like(clear)[:, None]], 1)
+        return o * live.float()[:, None]
 
     def _sample_cmd(self, idx):
         k = idx.numel()
@@ -430,9 +609,13 @@ class HumanoidEnv:
             self.gait[:], self.gait_goal[:] = gait, gait
 
     def _ramp_cmd(self):
-        """实际指令按加速度限制往目标靠。步频直接换; 着地比例: 目标是站定(1)时, 等速度降到 0 再换(否则"还在走却要两脚都着地"), 其他直接换。"""
+        """实际指令按加速度限制往目标靠。步频直接换; 着地比例: 目标是站定(1)时, 等速度降到 0 再换(否则"还在走却要两脚都着地"), 其他直接换。
+        躲球规划接管着的世界不动(由 _steer 管)。"""
         step = self.cmd_acc * self.dt
-        self.cmd += (self.cmd_goal - self.cmd).clamp(-step, step)
+        d = (self.cmd_goal - self.cmd).clamp(-step, step)
+        if self.balls and self.balls["steer"]:
+            d = d * (~self.dodge_on)[:, None]
+        self.cmd += d
         moving = self.cmd.abs().sum(dim=1) > 1e-6
         self.gait[:, 0] = self.gait_goal[:, 0]
         self.gait[:, 1] = torch.where((self.gait_goal[:, 1] >= 1) & moving & (self.gait[:, 1] < 1), self.gait[:, 1], self.gait_goal[:, 1])
@@ -454,6 +637,7 @@ class HumanoidEnv:
             height=lambda: self.qpos[:, 2:3],
             foot_contact=lambda: self.contact,
             push=lambda: rotate_inverse(q, torch.cat([self.push_f * (self.push_left > 0)[:, None], torch.zeros_like(self.push_f[:, :1])], 1)) / 100,
+            ball=self._ball_obs,
         )
 
     def _mirror_block(self, name):
@@ -463,7 +647,7 @@ class HumanoidEnv:
         table = dict(gravity=([0, 1, 2], [1, -1, 1]), lin_vel=([0, 1, 2], [1, -1, 1]), ang_vel=([0, 1, 2], [-1, 1, -1]),
                      joint_pos=(jp, js), joint_vel=(jp, js), last_action=(jp, js), cmd=([0, 1, 2], [1, -1, -1]), clock=([0, 1], [-1, -1]),
                      gait=([0, 1], [1, 1]), height=([0], [1]), foot_contact=([1, 0], [1, 1]),
-                     push=([0, 1, 2], [1, -1, 1]))
+                     push=([0, 1, 2], [1, -1, 1]), ball=(list(range(9)), [1, -1, 1, 1, -1, 1, 1, 1, 1]))
         assert name in table, f"观测块 {name} 没写左右镜像(_mirror_block)"
         return table[name]
 
@@ -493,7 +677,7 @@ class HumanoidEnv:
         valid = (self.c_idx < self.nacon[0]) & ((self.c_type & 1) != 0)              # 只看参与求解的接触
         r0, r1 = self.geom_role[g[:, 0].clamp(min=0)], self.geom_role[g[:, 1].clamp(min=0)]
         other = torch.where(r0 == 3, r1, r0)                                          # 地面以外的那个 geom 的角色
-        hit = valid & ((r0 == 3) | (r1 == 3)) & (other != 3)
+        hit = valid & ((r0 == 3) | (r1 == 3)) & (other != 3) & (other != 4)
         key = self.c_world.long().clamp(0, self.n - 1) * 3 + other.clamp(max=2)
         cnt = torch.bincount(key, weights=hit.float(), minlength=self.n * 3).view(self.n, 3)
         return cnt[:, 2] > 0, cnt[:, :2] > 0
@@ -521,7 +705,11 @@ class HumanoidEnv:
             # 分阶段起身时辅助力只在"站起来"阶段给: 前两个阶段要自己用手撑(辅助力拉躯干会替手把上身顶起来)
             on = (self.stage == 2).float() if self.rw["getup_stage"] else 1.0
             self.xfrc[:, self.assist_id, 2] = self.assist * self.weight * on
+        if self.balls:
+            self._ball_pre()
         wp.capture_launch(self.graph)
+        if self.balls:
+            self._ball_post()
         self.push_left = (self.push_left - 1).clamp(min=0)
         self.since_push += 1
         self.since_cmd += 1
@@ -557,6 +745,8 @@ class HumanoidEnv:
         if self.cmd_acc is not None:                       # 重新开局的直接用新指令, 其他的按加速度限制往目标靠
             self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
             self._ramp_cmd()
+        if self.balls and self.balls["steer"]:
+            self._steer()
         obs, critic = self._obs()
         return obs, critic, r, terminated, truncated, info
 
@@ -579,11 +769,15 @@ class HumanoidEnv:
             r = r + rw["ang_vel_fine"] * torch.exp(-((wz - self.cmd[:, 2]) ** 2) / TRACK_FINE)
         if rw["lat_vel"]:
             r = r + rw["lat_vel"] * torch.exp(-((vy_h - self.cmd[:, 1]) ** 2) / 0.25)
+        if self.balls:                                     # 到这里 r 只有速度跟踪: 来球时打折, 躲开不吃亏
+            r = r * (1 - self.balls["relax"] * self._ball_grace())
         r = r + rw["alive"]
         # 步态时钟: 右脚在 [0, D) 该踩地, 左脚晚半个周期; D = 0.5 就是左右严格轮换, D = 1 两脚都该踩地(站)
         want = (torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0 < self.gait[:, 1:2]).float()
         # 被推之后 PUSH_GRACE 秒内不管节奏: 要乱跨几步才稳得住(站着被推也一样); 换指令后 cmd_grace 秒内也不管(哪只脚先迈都行)
         grace = ((self.since_push.float() * self.dt < PUSH_GRACE) | (self.since_cmd.float() * self.dt < self.cmd_grace)).float()
+        if self.balls:                                     # 来球时也不管节奏(躲的那一步哪只脚都行)
+            grace = torch.maximum(grace, self._ball_grace())
         r = r + rw["clock"] * (1 - grace) * (self.contact == want).float().mean(dim=1)
         if rw["stand_feet"]:
             standing = (self.gait[:, 1] > 0.99).float() * (1 - grace)
@@ -679,6 +873,11 @@ class HumanoidEnv:
             v2 = (((pts[..., :2] - self.point_prev[..., :2]) / self.dt) ** 2).sum(dim=-1).clamp(max=1.0)
             r = r - rw["point_slip"] * (on * v2).sum(dim=(1, 2)) * (self.t > 1)
             self.point_prev.copy_(pts)
+        if self.balls and (rw["ball_hit"] or rw["ball_near"]):
+            r = r - rw["ball_hit"] * self.ball_hit.float()
+            if rw["ball_near"]:
+                clear, _, live = self._ball_predict()
+                r = r - rw["ball_near"] * live.float() * (1 - (clear / BALL_NEAR).clamp(0, 1))
         return r
 
     def body_ground(self):

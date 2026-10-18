@@ -2,7 +2,7 @@
 // 浏览器和 node 都能用: 调用方负责把 MuJoCo 模块、模型 XML 文本、policies.json(export_web.py 导出)、balls.json(可选)交进来。
 //   const ctl = new Controller(mujoco, xmlText, cfg, balls); ctl.resetStanding(); ctl.setCmd(0.8, 0, 0); ctl.step();
 // 一个策略步 = cfg.decimation 个物理步(50 Hz)。mode: 0 走路策略, 1 起身策略。
-// 发球机: addBalls 往场景里加一池球, ctl.throwBall 扔, aim 算出手速度(都和 cpu_check.py 一致)。
+// 发球机: addBalls 往场景里加一池球, ctl.throwBall 扔, aim 算出手速度, closestApproach + ctl.ballObs 是躲球策略的"球"观测块(都和 balls.py / cpu_check.py 一致)。
 
 function f32(b64) {
   const bin = typeof atob === 'function' ? atob(b64) : Buffer.from(b64, 'base64').toString('binary');
@@ -66,6 +66,23 @@ export function addBalls(xml, spec) {
   return xml.replace('</worldbody>', bodies + '</worldbody>');
 }
 
+// 来球(不计阻力的抛物线)和身体几个点(按水平速度 vb 平移)在接下来 CLOSE_T 秒里最近的时刻: 返回 [空隙 = 最近距离 - rSum, 几秒后]。同 balls.closest_approach
+export const BODY_R = 0.15, CLOSE_T = 1.5, CLOSE_K = 16;
+export const BALL_NEAR = 0.3, DODGE_HOLD = 0.3, DODGE_ACC = 100.0;   // 手写的躲球规划(同 balls.py): 预测空隙 < BALL_NEAR 起躲, 球结束后保持 DODGE_HOLD 秒
+export function closestApproach(p, v, pts, vb, g, rSum) {
+  let best = Infinity, bt = 0;
+  for (let k = 0; k < CLOSE_K; k++) {
+    const t = k * (CLOSE_T / (CLOSE_K - 1));
+    const bx = p[0] + v[0] * t, by = p[1] + v[1] * t, bz = p[2] + v[2] * t - 0.5 * g * (t * t);
+    for (const q of pts) {
+      const dx = bx - (q[0] + vb[0] * t), dy = by - (q[1] + vb[1] * t), dz = bz - (q[2] + vb[2] * t);
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d < best) { best = d; bt = t; }
+    }
+  }
+  return [best - rSum, bt];
+}
+
 // 从 src 以 speed 扔到 dst(世界系)要的出手速度, 低弹道, 算上空气阻力 drag = 阻力系数 / 质量(加速度 = -drag |v| v)。
 // 和 MuJoCo 里一样离散积分(阻力每个策略步算一次, 物理步半隐式欧拉)。返回 {vel, t, ok}; 打不到(ok = false)时给打得最高的角度
 export function aim(src, dst, speed, drag, dt, dec, g) {
@@ -114,12 +131,16 @@ export class Controller {
       balls.kinds.forEach((kd, kind) => {
         for (let j = 0; j < balls.per_kind; j++) {
           const b = m.nbody - n + this.balls.length, jnt = m.body_jntadr[b];
-          this.balls.push({ kind, body: b, qadr: m.jnt_qposadr[jnt], dadr: m.jnt_dofadr[jnt],
+          this.balls.push({ kind, body: b, qadr: m.jnt_qposadr[jnt], dadr: m.jnt_dofadr[jnt], r: kd.r,
                             drag: 0.5 * balls.air.rho * balls.air.cd * Math.PI * kd.r ** 2 / kd.mass });
         }
       });
     }
     this.nbh = m.nbody - this.balls.length;            // 人形(含 world)的刚体数, 球的刚体编号从这里开始
+    const B = mujoco.mjtObj.mjOBJ_BODY.value;
+    this.headId = mujoco.mj_name2id(m, B, 'head'); this.pelvisId = mujoco.mj_name2id(m, B, 'pelvis');
+    this.g = 9.81;                                     // 模型的重力(默认 0 0 -9.81, 同 cpu_check 用的 -opt.gravity[2])
+    this.dodge = !!cfg.dodge;                          // 躲球规划(env._steer): 走路策略是带着它练的(export_web.py 导出)
     this.ballState = new Int8Array(this.balls.length); // 0 停在高空, 1 飞行中(还没碰到东西), 2 碰过了
     this.ballSeq = new Array(this.balls.length).fill(-1);   // 第几个扔出去的(回收最早的那个)
     this.walk = new Net(cfg.walk); this.getup = new Net(cfg.getup);
@@ -149,6 +170,7 @@ export class Controller {
     const { c, d } = this;
     for (let i = 0; i < this.balls.length; i++) this.parkBall(i);
     this.nThrown = 0; this.hits = [];                  // hits: 球打到人的记录 [球, 刚体, 位置], 调用方取走
+    this.dodgeOn = false; this.dodgeDir = [0, 0]; this.ballAfter = 1e6; this._ended = false;
     d.ctrl.set(c.q_def);
     this.mj.mj_forward(this.m, d);
     this.action = new Array(this.nu).fill(0);
@@ -195,7 +217,7 @@ export class Controller {
       for (const [b, o] of [[b1, b2], [b2, b1]]) {
         const i = b - this.nbh;
         if (i >= 0 && this.ballState[i] === 1 && o < this.nbh) {
-          this.ballState[i] = 2;
+          this.ballState[i] = 2; this._ended = true;
           if (o > 0) this.hits.push([i, o, Array.from(con.pos)]);
         }
       }
@@ -224,6 +246,53 @@ export class Controller {
     return [fell, feet];
   }
 
+  _threat() {                                          // 飞行中的球里预测空隙最小的那个: [空隙, 几秒后最近, 位置, 速度]; 没有返回 null
+    const { d } = this, live = [];
+    this.ballState.forEach((st, i) => { if (st === 1) live.push(i); });
+    if (!live.length) return null;
+    const xp = d.xpos, qp = d.qpos, qv = d.qvel, P = (b) => [xp[b * 3], xp[b * 3 + 1], xp[b * 3 + 2]];
+    const pts = [P(this.headId), P(this.c.torso_body), P(this.pelvisId)], vb = [qv[0], qv[1], 0];
+    let best = null;
+    for (const i of live) {
+      const b = this.balls[i];
+      const p = [qp[b.qadr], qp[b.qadr + 1], qp[b.qadr + 2]], v = [qv[b.dadr], qv[b.dadr + 1], qv[b.dadr + 2]];
+      const [clear, tc] = closestApproach(p, v, pts, vb, this.g, BODY_R + b.r);
+      if (!best || clear < best[0]) best = [clear, tc, p, v];
+    }
+    return best;
+  }
+
+  ballObs() {                                          // 球的观测块(同 env._ball_obs); 没有飞行中的球就全 0
+    const th = this._threat();
+    if (!th) return new Array(9).fill(0);
+    const [clear, tc, p, v] = th, xp = this.d.xpos, qp = this.d.qpos;
+    const yaw = Math.atan2(2 * (qp[3] * qp[6] + qp[4] * qp[5]), 1 - 2 * (qp[5] ** 2 + qp[6] ** 2));
+    const c = Math.cos(yaw), s = Math.sin(yaw), t = this.c.torso_body * 3;
+    const hf = (x) => [c * x[0] + s * x[1], -s * x[0] + c * x[1], x[2]];
+    const rel = [p[0] - xp[t], p[1] - xp[t + 1], p[2] - xp[t + 2]];
+    return [...hf(rel).map((x) => x / 5), ...hf(v).map((x) => x / 10), tc / CLOSE_T, clamp(clear, -0.3, 2.0), 1];
+  }
+
+  _steer() {                                           // 手写的躲球规划(同 env._steer): 来球预测会打到时速度指令换成"往远离球路的方向全速走"
+    const { d, c } = this, th = this._threat(), live = !!th;
+    if (live && th[0] < BALL_NEAR && !this.dodgeOn) {
+      const [, tc, p, v] = th, t = c.torso_body * 3;
+      const bx = p[0] + v[0] * tc, by = p[1] + v[1] * tc;          // 球在最近时刻的水平位置(重力只影响 z)
+      const ax = d.xpos[t] + d.qvel[0] * tc - bx, ay = d.xpos[t + 1] + d.qvel[1] * tc - by, n = Math.max(Math.hypot(ax, ay), 1e-6);
+      this.dodgeDir = [ax / n, ay / n]; this.dodgeOn = true;
+    }
+    this.dodgeOn = this.dodgeOn && (live || this.ballAfter * this.dt < DODGE_HOLD);
+    if (!this.dodgeOn) return;
+    const qp = d.qpos, yaw = Math.atan2(2 * (qp[3] * qp[6] + qp[4] * qp[5]), 1 - 2 * (qp[5] ** 2 + qp[6] ** 2));
+    const cy = Math.cos(yaw), sy = Math.sin(yaw), [dx, dy] = this.dodgeDir;
+    const hx = cy * dx + sy * dy, hy = -sy * dx + cy * dy, R = c.cmd_range;
+    const ex = hx >= 0 ? R.vx[1] : -R.vx[0], ey = hy >= 0 ? R.vy[1] : -R.vy[0];
+    const k = 1 / Math.max(Math.sqrt((hx / ex) ** 2 + (hy / ey) ** 2), 1e-6), s = DODGE_ACC * this.dt;
+    const esc = [hx * k, hy * k, 0];
+    this.cmd = this.cmd.map((v, i) => v + clamp(esc[i] - v, -s, s));
+    this.gait[1] = c.gait_walk[1];                     // 站定的也要迈步
+  }
+
   obs(layout, lastAction) {
     const { d, c } = this;
     const qpos = d.qpos, qvel = d.qvel;
@@ -238,6 +307,7 @@ export class Controller {
       cmd: () => this.cmd,
       clock: () => [Math.sin(2 * Math.PI * this.phase), Math.cos(2 * Math.PI * this.phase)],
       gait: () => this.gait,
+      ball: () => this.ballObs(),
     };
     return layout.flatMap(([name]) => blocks[name]());
   }
@@ -273,21 +343,24 @@ export class Controller {
       const k = -b.drag * m.body_mass[b.body] * Math.sqrt(v0 * v0 + v1 * v1 + v2 * v2);
       xf[b.body * 6] = k * v0; xf[b.body * 6 + 1] = k * v1; xf[b.body * 6 + 2] = k * v2;
     });
+    this._ended = false;
     for (let k = 0; k < c.decimation; k++) {
       this.mj.mj_step(m, d);
       if (this.ballState.includes(1)) this._ballContacts();
     }
+    this.ballAfter = this._ended ? 0 : this.ballAfter + 1;
     this.pushLeft = Math.max(0, this.pushLeft - 1);
     this.phase = (this.phase + this.dt * this.gait[0]) % 1.0;
     if (c.cmd_acc) {                                   // 同 env._ramp_cmd
       const s = c.cmd_acc * this.dt;
-      this.cmd = this.cmd.map((v, i) => v + clamp(this.cmdGoal[i] - v, -s, s));
+      if (!this.dodgeOn) this.cmd = this.cmd.map((v, i) => v + clamp(this.cmdGoal[i] - v, -s, s));   // 躲球规划接管着时不动
       const moving = Math.abs(this.cmd[0]) + Math.abs(this.cmd[1]) + Math.abs(this.cmd[2]) > 1e-6;
       this.gait[0] = this.gaitGoal[0];
       if (!(this.gaitGoal[1] >= 1 && moving && this.gait[1] < 1)) this.gait[1] = this.gaitGoal[1];
     } else {
       this.cmd = [...this.cmdGoal]; this.gait = [...this.gaitGoal];
     }
+    if (this.dodge) this._steer();
     return [o, a];
   }
 }
