@@ -18,6 +18,7 @@ p.add_argument("--arm-pose", default="models/arm_pose.json")
 p.add_argument("--envs", type=int, default=4096)
 p.add_argument("--rounds", type=int, default=2)
 p.add_argument("--out", default="models/fallen_poses.pt")
+p.add_argument("--between", type=int, default=0, help="往姿态库里追加这么多个'平趴 -> 四肢着地'之间的过渡姿态(撑起中), 当起身训练的课程")
 p.add_argument("--mid", type=int, default=0, help="往已有的姿态库里追加中间姿态(坐、跪、四肢着地)各这么多个, 不重新生成倒地姿态")
 a = p.parse_args()
 
@@ -36,7 +37,7 @@ def classify(q):
     return c
 
 
-NAMES = ("仰躺", "趴", "侧躺", "坐/跪", "四肢着地")
+NAMES = ("仰躺", "趴", "侧躺", "坐/跪", "四肢着地", "撑起中")
 
 
 FOURS_PITCH = 1.19         # 弧度(68°): 肩高 - 胯高 = 0.52 m x cos(俯仰) ≈ 手臂长 - 大腿长 = 0.2 m
@@ -101,6 +102,35 @@ if __name__ == "__main__":
     env = HumanoidEnv(a.envs, xml=a.xml, arm_pose=a.arm_pose, seed=1)
     n, dev = env.n, env.dev
     keep = []
+    if a.between:                                          # 追加"撑起中": 从四肢着地出发, 关节目标 2 秒内慢慢变成平趴(腿伸直、手臂贴身), 随机时刻记下
+        bank = torch.load(a.out)                           # 相当于把"趴 -> 四肢着地"倒着放, 每个姿态都是物理上真能到的(直接摆的中间姿态多数会翻倒)
+        src = bank["qpos"][bank["cls"] == 4]
+        got = []
+        while sum(len(x) for x in got) < a.between:
+            q0 = src[torch.randint(0, len(src), (n,))].to(dev)
+            env.reset_idx(torch.arange(n, device=dev))
+            env.qpos[:] = q0
+            env.qvel[:] = 0
+            start = env.qpos[:, env.qadr].clamp(env.lo, env.hi).clone()
+            T, rec = 125, torch.randint(0, 125, (n,), device=dev)          # 2.5 秒, 每个世界在随机一步记下
+            out = torch.zeros_like(env.qpos)
+            for t in range(T):
+                s_ = min(t / 100, 1.0)
+                env.ctrl[:] = start + (env.q_def - start) * s_
+                env.xfrc[:] = 0
+                wp.capture_launch(env.graph)
+                hit = rec == t
+                out[hit] = env.qpos[hit]
+            wp.synchronize()
+            g = quat_to_gravity(out[:, 3:7])
+            ok = torch.isfinite(out).all(1) & (g[:, 0] > 0.3)             # 胸口还朝下的才要
+            got.append(out[ok].cpu())
+            print(f"撑起中: 留下 {int(ok.sum())}/{n}", env.diagnostics())
+        qb = torch.cat(got)[:a.between]
+        qpos, c = torch.cat([bank["qpos"], qb]), torch.cat([bank["cls"], torch.full((len(qb),), 5)])
+        print("共", qpos.shape[0], "个; " + ", ".join(f"{NAMES[i]} {int((c == i).sum())}" for i in range(len(NAMES))))
+        torch.save(dict(qpos=qpos, cls=c, names=NAMES, xml=a.xml), a.out)
+        raise SystemExit
     if a.mid:                                              # 追加中间姿态: 摆好后 PD 保持这个姿势落稳 1.5 秒
         bank = torch.load(a.out)
         qm, cm = mid_poses(env, a.mid)

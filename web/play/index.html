@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>人偶互动</title>
+<style>
+  :root { --panel:rgba(16,22,34,.78); --line:rgba(255,255,255,.14); --tx:#e8eef7; --dim:#9fb0c7; --acc:#ffb347; --bad:#ff7b72; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:#0e1420; color:var(--tx); font:14px/1.45 system-ui, "Microsoft YaHei", sans-serif; overflow:hidden; }
+  canvas#c { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  .panel { position:fixed; background:var(--panel); border:1px solid var(--line); border-radius:12px; backdrop-filter:blur(8px); }
+  #top { top:calc(12px + env(safe-area-inset-top, 0px)); left:12px; padding:10px 14px; max-width:min(380px, calc(100vw - 24px)); }
+  #top h1 { margin:0 0 4px; font-size:15px; font-weight:600; }
+  #top p { margin:0; color:var(--dim); font-size:12px; }
+  #stat { margin-top:8px; display:grid; grid-template-columns:auto 1fr; gap:2px 10px; font-variant-numeric:tabular-nums; }
+  #stat .k { color:var(--dim); }
+  #mode.getup { color:var(--bad); font-weight:600; }
+  #bar { left:12px; right:12px; bottom:calc(12px + env(safe-area-inset-bottom, 0px)); padding:10px 14px; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; }
+  button { background:rgba(255,255,255,.08); color:var(--tx); border:1px solid var(--line); border-radius:8px; padding:6px 12px; font:inherit; cursor:pointer; touch-action:none; user-select:none; }
+  button:hover { border-color:var(--acc); }
+  button.on { border-color:var(--acc); background:rgba(255,179,71,.18); }
+  #pad { display:grid; grid-template-columns:repeat(3, 40px); gap:4px; }
+  #pad button { padding:6px 0; }
+  label.sl { display:flex; align-items:center; gap:6px; color:var(--dim); }
+  label.sl input { accent-color:var(--acc); width:110px; }
+  .sep { flex:1 1 auto; }
+  #msg { position:fixed; inset:0; display:grid; place-items:center; text-align:center; color:var(--dim); padding:24px; pointer-events:none; }
+  [hidden] { display:none !important; }
+</style>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.js","three/addons/":"../vendor/"}}</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg">加载物理引擎和策略网络…</div>
+<div class="panel" id="top">
+  <h1>人偶互动 <a href="../index.html" style="color:var(--acc);font-size:13px;font-weight:400;margin-left:8px">训练回放 →</a></h1>
+  <p>WASD / 方向键走，Q / E 转身，按住 Shift 走快；在人身上按住鼠标往一个方向拖，松开就朝那个方向推（拖得越长越用力）。物理是 MuJoCo（浏览器里跑），动作全由训练好的策略网络决定，倒了会自己爬起来。</p>
+  <div id="stat">
+    <span class="k">状态</span><span id="mode">—</span>
+    <span class="k">指令</span><span id="cmd">站定</span>
+    <span class="k">摔倒 / 起身</span><span id="falls">0 / 0</span>
+    <span class="k">推力</span><span id="force">—</span>
+  </div>
+</div>
+<div class="panel" id="bar">
+  <div id="pad" aria-label="方向">
+    <button data-k="KeyQ" aria-label="左转">⟲</button><button data-k="KeyW" aria-label="前进">▲</button><button data-k="KeyE" aria-label="右转">⟳</button>
+    <button data-k="KeyA" aria-label="左移">◀</button><button data-k="KeyS" aria-label="后退">▼</button><button data-k="KeyD" aria-label="右移">▶</button>
+  </div>
+  <label class="sl">前进速度 <input id="speed" type="range" min="0.4" max="1.2" step="0.1" value="0.8"><span id="speedv">0.8</span> m/s</label>
+  <label class="sl">推力上限 <input id="pmax" type="range" min="100" max="800" step="50" value="500"><span id="pmaxv">500</span> N</label>
+  <span class="sep"></span>
+  <button id="shove">随机推一下</button>
+  <button id="knock">推倒它</button>
+  <button id="slow">慢放</button>
+  <button id="reset">重来</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { makeMats, dressCharacter, updateLinks } from '../character.js';
+import loadMujoco from '../vendor/mujoco/mujoco.js';
+import { Controller } from './sim.js';
+
+const $ = (id) => document.getElementById(id);
+
+// ---------- 场景(同回放页面) ----------
+const renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+const scene = new THREE.Scene();
+{
+  const c = document.createElement('canvas'); c.width = 4; c.height = 256;
+  const g = c.getContext('2d'), gr = g.createLinearGradient(0, 0, 0, 256);
+  gr.addColorStop(0, '#5b8fd1'); gr.addColorStop(.55, '#a9c9ea'); gr.addColorStop(1, '#e8eef2');
+  g.fillStyle = gr; g.fillRect(0, 0, 4, 256);
+  scene.background = new THREE.CanvasTexture(c); scene.background.colorSpace = THREE.SRGBColorSpace;
+}
+scene.fog = new THREE.Fog(0xcfdcea, 28, 110);
+const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 400);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.08; controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 1.5; controls.maxDistance = 30;
+camera.position.set(2.6, 1.7, 3.6); controls.target.set(0, 0.9, 0);
+scene.add(new THREE.HemisphereLight(0xe4f0ff, 0x6e7a58, 1.05));
+const sun = new THREE.DirectionalLight(0xfff0dc, 2.4);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004;
+Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 50 });
+scene.add(sun, sun.target);
+const ground = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#7d9a68'; g.fillRect(0, 0, 256, 256); g.fillStyle = '#86a46f'; g.fillRect(0, 0, 128, 128); g.fillRect(128, 128, 128, 128);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(100, 100); t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(400, 400).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ map: t, roughness: 0.96 }));
+  m.receiveShadow = true; scene.add(m); return m;
+})();
+// MuJoCo 是 Z 轴朝上: 人形放进绕 X 轴转 -90° 的组里。three (x, y, z) = MuJoCo (x, z, -y)
+const mjGroup = new THREE.Group(); mjGroup.rotation.x = -Math.PI / 2; scene.add(mjGroup);
+const toThree = (x, y, z) => new THREE.Vector3(x, z, -y);
+
+// ---------- 物理 + 策略 ----------
+let ctl, W, nb;
+try {
+  const [mujoco, cfg] = await Promise.all([loadMujoco(), fetch('policies.json').then((r) => { if (!r.ok) throw new Error('找不到 policies.json, 先运行 export_web.py'); return r.json(); })]);
+  const xml = await (await fetch(cfg.xml)).text();
+  ctl = new Controller(mujoco, xml, cfg);
+  const m = ctl.m;
+  // 刚体和几何体的清单(格式同 export.py 的 model_info), 给 dressCharacter 用
+  const data = { bodies: [], geoms: [] };
+  for (let i = 0; i < m.nbody; i++) data.bodies.push({ name: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY.value, i), parent: m.body_parentid[i] });
+  const T = { [mujoco.mjtGeom.mjGEOM_SPHERE.value]: 'sphere', [mujoco.mjtGeom.mjGEOM_CAPSULE.value]: 'capsule' };
+  for (let g = 0; g < m.ngeom; g++) {
+    if (m.geom_type[g] === mujoco.mjtGeom.mjGEOM_PLANE.value) continue;
+    data.geoms.push({ body: m.geom_bodyid[g], type: T[m.geom_type[g]], size: [m.geom_size[g * 3], m.geom_size[g * 3 + 1]],
+                      pos: Array.from(m.geom_pos.slice(g * 3, g * 3 + 3)), quat: Array.from(m.geom_quat.slice(g * 4, g * 4 + 4)) });
+  }
+  nb = m.nbody;
+  const wg = new THREE.Group(); mjGroup.add(wg);
+  const bodyObjs = data.bodies.map(() => { const o = new THREE.Object3D(); wg.add(o); return o; });
+  const { links } = dressCharacter(data, bodyObjs, makeMats(0x3e8bff));
+  W = { bodyObjs, links, prevPos: new Float64Array(nb * 3), prevQuat: new Float64Array(nb * 4) };
+  snapshot();
+  $('msg').hidden = true;
+  window.__play = { ctl, THREE, camera, controls, mujoco, mjGroup, scene };
+} catch (e) { $('msg').textContent = '加载失败: ' + (e.message || e); console.error(e); throw e; }
+
+function snapshot() { W.prevPos.set(ctl.d.xpos); W.prevQuat.set(ctl.d.xquat); }   // 物理步之前的姿态, 画面在两步之间插值
+
+const qa = new THREE.Quaternion(), qb = new THREE.Quaternion();
+function drawBody(alpha) {
+  const xp = ctl.d.xpos, xq = ctl.d.xquat, P = W.prevPos, Q = W.prevQuat;
+  for (let b = 1; b < nb; b++) {
+    const o = W.bodyObjs[b], p = b * 3, q = b * 4;
+    o.position.set(P[p] + (xp[p] - P[p]) * alpha, P[p + 1] + (xp[p + 1] - P[p + 1]) * alpha, P[p + 2] + (xp[p + 2] - P[p + 2]) * alpha);
+    qa.set(Q[q + 1], Q[q + 2], Q[q + 3], Q[q]); qb.set(xq[q + 1], xq[q + 2], xq[q + 3], xq[q]);
+    o.quaternion.slerpQuaternions(qa, qb, alpha);
+  }
+  updateLinks(W);
+}
+
+// ---------- 指令: 键盘 + 屏幕按钮 ----------
+const keys = new Set();
+const KEYMAP = { ArrowUp: 'KeyW', ArrowDown: 'KeyS', ArrowLeft: 'KeyA', ArrowRight: 'KeyD' };
+addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT') return; keys.add(KEYMAP[e.code] || e.code); if (e.code.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keyup', (e) => { keys.delete(KEYMAP[e.code] || e.code); });
+addEventListener('blur', () => keys.clear());
+for (const b of document.querySelectorAll('#pad button')) {
+  const k = b.dataset.k;
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); keys.add(k); b.classList.add('on'); b.setPointerCapture(e.pointerId); });
+  const up = () => { keys.delete(k); b.classList.remove('on'); };
+  b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up);
+}
+const R = ctl.c.cmd_range;
+function currentCmd() {
+  const fast = keys.has('ShiftLeft') || keys.has('ShiftRight');
+  const v = fast ? R.vx[1] : +$('speed').value;
+  let vx = 0, vy = 0, wz = 0;
+  if (keys.has('KeyW')) vx += v;
+  if (keys.has('KeyS')) vx += R.vx[0] * 0.67;          // 倒退慢一点(训练到 -0.6)
+  if (keys.has('KeyA')) vy += R.vy[1] * 0.75;
+  if (keys.has('KeyD')) vy += R.vy[0] * 0.75;
+  if (keys.has('KeyQ')) wz += R.wz[1];
+  if (keys.has('KeyE')) wz += R.wz[0];
+  return [vx, vy, wz];
+}
+$('speed').oninput = (e) => { $('speedv').textContent = (+e.target.value).toFixed(1); };
+$('pmax').oninput = (e) => { $('pmaxv').textContent = e.target.value; };
+
+// ---------- 推: 在人身上按住往外拖, 松开就推 ----------
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const arrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0.5, 0xff3b30, 0.18, 0.13);
+arrow.visible = false; scene.add(arrow);
+let drag = null, arrowUntil = 0;
+const DRAG_FULL = 1.2;                                   // 拖 1.2 米 = 推力上限
+const torsoThree = () => { const p = ctl.d.xpos, t = ctl.c.torso_body * 3; return toThree(p[t], p[t + 1], p[t + 2]); };
+function rayAt(e) { ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); ray.setFromCamera(ndc, camera); }
+function showArrow(dir, len, at) {                      // dir: three 坐标的水平方向; 箭头从躯干外侧指向推的方向
+  arrow.setDirection(dir); arrow.setLength(Math.max(0.25, len), 0.18, 0.13);
+  arrow.position.copy(at).addScaledVector(dir, -Math.max(0.25, len) - 0.15); arrow.visible = true;
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  rayAt(e);
+  const hit = ray.intersectObject(mjGroup, true)[0];
+  if (!hit) return;
+  const h = torsoThree().y;
+  plane.constant = -h;
+  const p0 = new THREE.Vector3(); if (!ray.ray.intersectPlane(plane, p0)) return;
+  drag = { p0, id: e.pointerId, force: [0, 0] }; controls.enabled = false;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  rayAt(e);
+  const p = new THREE.Vector3(); if (!ray.ray.intersectPlane(plane, p)) return;
+  const v = p.sub(drag.p0); v.y = 0;
+  const len = Math.min(v.length(), DRAG_FULL), f = len / DRAG_FULL * +$('pmax').value;
+  if (len < 0.02) { arrow.visible = false; drag.force = [0, 0]; return; }
+  v.normalize();
+  drag.force = [v.x * f, -v.z * f];                     // three -> MuJoCo: x 不变, MuJoCo y = -three z
+  showArrow(v, len, torsoThree());
+  $('force').textContent = `${f.toFixed(0)} N(松开就推)`;
+});
+const endDrag = (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const [fx, fy] = drag.force, f = Math.hypot(fx, fy);
+  if (f > 1) { ctl.push(fx, fy); arrowUntil = performance.now() + 500; $('force').textContent = `推了 ${f.toFixed(0)} N`; }
+  else arrow.visible = false;
+  drag = null; controls.enabled = true;
+};
+renderer.domElement.addEventListener('pointerup', endDrag);
+renderer.domElement.addEventListener('pointercancel', endDrag);
+function pushRandom(mag) {
+  const a = Math.random() * 2 * Math.PI, fx = Math.cos(a) * mag, fy = Math.sin(a) * mag;
+  ctl.push(fx, fy); arrowUntil = performance.now() + 500;
+  const dir = new THREE.Vector3(fx, 0, -fy).normalize();
+  showArrow(dir, 0.6, torsoThree()); $('force').textContent = `推了 ${mag} N`;
+}
+$('shove').onclick = () => pushRandom(Math.min(250, +$('pmax').value));
+$('knock').onclick = () => pushRandom(600);
+$('reset').onclick = () => { ctl.resetStanding(); snapshot(); };
+let slow = false;
+$('slow').onclick = () => { slow = !slow; $('slow').classList.toggle('on', slow); };
+
+// ---------- 主循环: 物理按真实时间跑(每 0.02 秒一个策略步), 画面在两步之间插值 ----------
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+let last = performance.now(), acc = 0, simMs = 0;
+const follow = new THREE.Vector3(), tmp = new THREE.Vector3();
+function tick(now) {
+  const real = Math.min((now - last) / 1000, 0.1); last = now;
+  acc += real * (slow ? 0.25 : 1);
+  ctl.setCmd(...currentCmd());
+  const t0 = performance.now();
+  for (let k = 0; acc >= ctl.dt && k < 6; k++) { snapshot(); ctl.step(); acc -= ctl.dt; }
+  if (acc > ctl.dt) acc = 0;                             // 掉帧太多就丢掉, 不追
+  simMs = simMs * 0.9 + (performance.now() - t0) * 0.1;
+  drawBody(Math.min(acc / ctl.dt, 1));
+  if (arrow.visible && !drag && now > arrowUntil) arrow.visible = false;
+  // 镜头跟着躯干水平移动
+  const p = W.bodyObjs[ctl.c.torso_body].getWorldPosition(follow);
+  tmp.set(p.x - controls.target.x, 0, p.z - controls.target.z).multiplyScalar(0.08);
+  camera.position.add(tmp); controls.target.add(tmp);
+  ground.position.set(Math.round(controls.target.x / 4) * 4, 0, Math.round(controls.target.z / 4) * 4);
+  sun.position.set(controls.target.x + 7, 14, controls.target.z + 5); sun.target.position.copy(controls.target);
+  // 状态栏
+  $('mode').textContent = ctl.mode === 0 ? '走路策略' : '起身策略(爬起来中)';
+  $('mode').className = ctl.mode === 0 ? '' : 'getup';
+  const c = ctl.cmdGoal;
+  $('cmd').textContent = Math.abs(c[0]) + Math.abs(c[1]) + Math.abs(c[2]) < 1e-6 ? '站定'
+    : `前进 ${c[0].toFixed(1)}  侧移 ${c[1].toFixed(1)} m/s  转向 ${c[2].toFixed(1)} rad/s`;
+  $('falls').textContent = `${ctl.nFalls} / ${ctl.nUp} · 物理+网络 ${simMs.toFixed(1)} ms/帧`;
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

@@ -67,6 +67,9 @@ REWARD = dict(
     getup_hand=0.0,    # 躯干还低(高度 < 站立的 GETUP_HAND_Z)、手撑在地上、躯干正在往上升时给, 每只手一半, 再乘上升速度 / 0.5 m/s(封顶 1)。
                        # getup7 加了费力惩罚, 仰躺起来手还是 0% 撑地(只用腿蹬)。试过: 只算"手撑 + 躯干离地"(getup8)它碰不到, 没效果;
                        # "手撑 + 坐起来"(getup9)趴着的撑起上身就不起来了(一直拿奖励)。例如 1.0
+    getup_stage=0.0,   # 分阶段模仿起身(> 0 时打开, 是每个阶段的基础分): 0 翻成趴着 -> 1 撑成四肢着地(跟踪关键姿势 FOURS_*) -> 2 站起来(上面几项)。
+                       # 阶段越靠后基础分越高, 停在半路不划算。只靠奖励时手几乎不撑地(getup7~12), 这里把"手撑着起来"写成必经的关键姿势。例如 1.0
+    getup_track=1.0,   # 阶段 0 / 1 里跟关键姿势像不像的那部分(0~1)的权重
     getup_stand=2.0,   # 站起来了(高度 > 90%、立直、只有脚着地)以后: 一半看不动(水平速度小), 一半看姿态接近默认站姿(交给走路策略时好接)
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
@@ -75,6 +78,10 @@ LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 
 KNEE_SWING_DEG = 40.0     # 度, 摆腿中途膝盖弯多少(真人走路约 60°, 慢走、侧移小一些)
 KNEE_MIN_DEG = 5.0        # 度, 膝盖至少弯这么多(真人着地期约 5~20°, 站着约 0~5°)
 GETUP_HAND_Z = 0.6        # 躯干高度 / 站立 低于它才算"还低", 手撑地给奖励
+FOURS_PITCH = 1.19         # 四肢着地的关键姿势: 躯干前倾 68°, 手臂前举、髋屈同样角度(手臂和大腿竖直向下), 膝屈 90°(同 make_fallen.py)
+FOURS_Z = 0.60            # 四肢着地时躯干(根)的高度, 米(姿态库里实测中位数)
+FOURS_HOLD = 5            # 和关键姿势够像(三项都 > FOURS_SIM)连续这么多步, 进入"站起来"阶段
+FOURS_SIM = 0.6
 GETUP_MAX_V = 1.0         # m/s, 起身时躯干速度上限(超过才罚)
 GETUP_MAX_W = 4.0         # rad/s, 起身时躯干角速度上限
 PUSH_GRACE = 1.0          # 秒, 被推之后多久内不按步态时钟奖励节奏
@@ -169,7 +176,7 @@ class HumanoidEnv:
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
                  arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None,
-                 push_force=0.0, push_period=(100, 250), push_len=10, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1):
+                 push_force=0.0, push_period=(100, 250), push_len=10, cmd_turn=0.0, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1, getup_classes=None):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -182,6 +189,7 @@ class HumanoidEnv:
         # 步态指令的范围; 没给步频就用固定的 1 / gait_period(旧配置只有 gait_period)
         self.gait_rng = (cmd_freq or (1.0 / gait_period, 1.0 / gait_period), cmd_duty)
         self.stand_prob = cmd_stand                       # 抽指令时有这么大概率是"站定": 速度全 0、着地比例 1
+        self.turn_prob = cmd_turn                         # 抽指令时有这么大概率是"原地转身": 前进、侧移为 0, 只有转向(网页里只按 Q/E 就是这样)
         # 指令加速度限制(m/s^2, 转向 rad/s^2 同值): 新抽的指令是目标, 实际指令每步最多变 cmd_acc * dt。None = 瞬间换(旧策略)
         self.cmd_acc = cmd_acc
         self.rw = dict(REWARD, **(reward or {}))
@@ -237,6 +245,24 @@ class HumanoidEnv:
             bank = torch.load(getup_poses, map_location=self.dev)
             self.fallen, self.fallen_cls, self.fallen_names = bank["qpos"].float(), bank["cls"], bank["names"]
             self.getup_pick = torch.full((nworld,), -1, dtype=torch.long, device=self.dev)
+            cls = self.fallen_cls.to(self.dev)
+            self.fallen_idx = (torch.isin(cls, torch.tensor(getup_classes, device=self.dev)) if getup_classes is not None
+                               else torch.ones_like(cls, dtype=torch.bool)).nonzero().squeeze(1)    # 开局只从这些类别里抽
+            self.stage = torch.zeros(nworld, dtype=torch.long, device=self.dev)      # 分阶段起身: 每个人形走到哪一步了
+            self.stage_run = torch.zeros(nworld, dtype=torch.long, device=self.dev)
+            # 四肢着地的关键姿势(动作顺序的关节角)和要跟踪的关节: 髋前后、膝、肩、肘
+            fq = self.q_def.clone()
+            dirs = arm_swing_dirs(mjm, pose) if arm_pose else {}
+            for i, n in enumerate(names):
+                if n.startswith("hip_y"):
+                    fq[i] = -FOURS_PITCH
+                elif n.startswith("knee"):
+                    fq[i] = -math.pi / 2
+                elif n in dirs:
+                    fq[i] = self.q_def[i] + FOURS_PITCH * dirs[n]
+            self.fours_q = fq
+            self.fours_mask = torch.tensor([n.startswith(("hip_y", "knee", "shoulder", "elbow")) for n in names], dtype=torch.float32, device=self.dev)
+            self.fours_g = torch.tensor([math.sin(FOURS_PITCH), 0.0, -math.cos(FOURS_PITCH)], device=self.dev)   # 躯干前倾时重力在躯干系的方向
         # 起身训练的辅助力(课程): 向上拉躯干, 大小 = assist x 体重; train.py --assist 按站起来的比例逐步减到 0。回放、测验、网页里都是 0
         self.assist, self.weight = 0.0, float(mjm.body_mass.sum()) * 9.81
         self.assist_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "torso")   # 拉哪个刚体: 躯干(getup3), 或胯部(train.py --assist-at pelvis, 不替手把上身顶起来)
@@ -328,7 +354,7 @@ class HumanoidEnv:
         qvel[:, :6] = (torch.rand(k, 6, **f) * 2 - 1) * 0.1
         if self.getup:                                    # 大部分从倒地姿态开始(朝向随机转), 少数站着开始(学会站住不动)
             lie = torch.rand(k, device=self.dev) >= self.getup_stand_frac
-            pick = torch.randint(0, self.fallen.shape[0], (k,), device=self.dev)
+            pick = self.fallen_idx[torch.randint(0, self.fallen_idx.shape[0], (k,), device=self.dev)]
             self.getup_pick[idx] = torch.where(lie, pick, -1)      # 测验按姿态类别分开统计用
             p = self.fallen[pick]
             p[:, :2] = 0
@@ -337,6 +363,8 @@ class HumanoidEnv:
             p[:, 3:7] = torch.stack([cy * w - sy * z, cy * x - sy * y, cy * y + sy * x, cy * z + sy * w], 1)
             qpos[lie] = p[lie]
             qvel[lie] = 0
+            self.stage[idx] = torch.where(lie, 0, 2)              # 站着开局的直接在"站"阶段
+            self.stage_run[idx] = 0
         self.qpos[idx], self.qvel[idx] = qpos, qvel
         self.ctrl[idx] = self.q_def
         self.warm[idx] = 0
@@ -361,6 +389,9 @@ class HumanoidEnv:
             st = idx[torch.rand(k, device=self.dev) < self.stand_prob]
             self.cmd_goal[st] = 0.0
             self.gait_goal[st, 1] = 1.0
+        if self.turn_prob > 0:
+            tr = idx[torch.rand(k, device=self.dev) < self.turn_prob]
+            self.cmd_goal[tr, :2] = 0.0
         if self.cmd_acc is None:
             self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
         p = self.cmd_period
@@ -470,7 +501,9 @@ class HumanoidEnv:
             self.push_next -= 1
         self.xfrc[:, self.torso_id, :2] = self.push_f * (self.push_left > 0)[:, None]
         if self.getup:
-            self.xfrc[:, self.assist_id, 2] = self.assist * self.weight
+            # 分阶段起身时辅助力只在"站起来"阶段给: 前两个阶段要自己用手撑(辅助力拉躯干会替手把上身顶起来)
+            on = (self.stage == 2).float() if self.rw["getup_stage"] else 1.0
+            self.xfrc[:, self.assist_id, 2] = self.assist * self.weight * on
         wp.capture_launch(self.graph)
         self.push_left = (self.push_left - 1).clamp(min=0)
         self.since_push += 1
@@ -655,6 +688,24 @@ class HumanoidEnv:
         self.m_stood = stood
         self.stood_sum, self.stood_cnt = self.stood_sum + stood.sum(), self.stood_cnt + self.n     # 不同步回 CPU, train.py 每轮读一次
         r = rw["getup_height"] * z + rw["getup_up"] * up * z + rw["getup_stand"] * stood * 0.5 * (still + pose)
+        if rw["getup_stage"]:
+            # 阶段 0: 胸口朝下的程度(重力在躯干系的 x 分量, 胸口朝下时为正); 阶段 1: 和四肢着地的关键姿势像不像
+            chest = g[:, 0]
+            # 三项(关节角、躯干朝向、躯干高度)取平均当奖励, 宽度放大: 平趴时也有梯度(三项相乘、宽度窄时平趴几乎是 0, getup13 就一直趴着);
+            # 进阶要三项都 > FOURS_SIM
+            sj = torch.exp(-((self.fours_mask * (self.qpos[:, self.qadr] - self.fours_q)) ** 2).sum(dim=1) / 6.0)
+            so = torch.exp(-((g - self.fours_g) ** 2).sum(dim=1) / 0.3)
+            sh = torch.exp(-((self.qpos[:, 2] - FOURS_Z) / 0.25) ** 2)
+            sim = (sj + so + sh) / 3
+            self.m_sim = sim
+            reached = torch.minimum(torch.minimum(sj, so), sh) > FOURS_SIM
+            base = rw["getup_stage"]
+            r = torch.where(self.stage == 0, rw["getup_track"] * (chest + 1) / 2,
+                            torch.where(self.stage == 1, base + rw["getup_track"] * sim, 2 * base + r))
+            # 推进阶段(只进不退): 胸口朝下 -> 1; 像四肢着地连续 FOURS_HOLD 步 -> 2; 任何时候站起来了 -> 2
+            self.stage = torch.where((self.stage == 0) & (chest > 0.5), 1, self.stage)
+            self.stage_run = torch.where((self.stage == 1) & reached, self.stage_run + 1, torch.zeros_like(self.stage_run))
+            self.stage = torch.where(((self.stage == 1) & (self.stage_run >= FOURS_HOLD)) | (stood > 0), 2, self.stage)
         if rw["getup_effort"]:
             self.m_effort = ((self.frc[:, self.dadr] / self.tau_max.to(self.dev)) ** 2).sum(dim=1)
             r = r - rw["getup_effort"] * self.m_effort

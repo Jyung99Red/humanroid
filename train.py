@@ -39,6 +39,7 @@ p.add_argument("--wz", default="-0.3,0.3", help="指令范围: 转向速度 rad/
 p.add_argument("--freq", default="", help="指令范围: 步频(步态周期/秒, 步数/分 = 120 x 步频); 不给就固定为 1/gait-period")
 p.add_argument("--duty", default="0.5,0.5", help="指令范围: 着地比例(>0.5 走, <0.5 跑, 1 站)")
 p.add_argument("--stand", type=float, default=0.0, help="抽指令时站定(速度全 0、着地比例 1)的概率, 例如 0.15")
+p.add_argument("--turn", type=float, default=0.0, help="抽指令时原地转身(前进、侧移为 0, 只转向)的概率, 例如 0.1")
 p.add_argument("--cmd-period", default="", help="多少秒换一次指令 lo,hi(每次随机抽), 例如 1,5; 不给就固定 5 秒")
 p.add_argument("--cmd-acc", type=float, default=0.0, help="指令加速度限制 m/s^2(转向 rad/s^2 同值), 例如 1.5; 0 = 新指令瞬间生效")
 p.add_argument("--out", type=str, default="runs/walk1")
@@ -58,6 +59,7 @@ p.add_argument("--getup", action="store_true", help="训练起身策略: 从倒�
 p.add_argument("--assist", type=float, default=0.0, help="起身训练的辅助力起点(体重的几成, 例如 0.6): 向上拉躯干, 站起来的时间比例 > 0.5 就每轮减 0.005, 减到 0 为止")
 p.add_argument("--assist-at", default="torso", help="辅助力拉哪个刚体: torso(躯干, 会替手把上身顶起来, getup3~7 只用腿蹬) 或 pelvis(胯部)")
 p.add_argument("--effort-ramp", action="store_true", help="费力惩罚 getup_effort 跟着辅助力加: 权重 = 给定值 x (1 - 当前辅助力 / 起点)。从头就加满时策略学成躺着不动(getup11)")
+p.add_argument("--getup-classes", default="", help="起身开局只从姿态库的这些类别抽(逗号分隔: 0 仰躺 1 趴 2 侧躺 3 坐/跪 4 四肢着地), 例如 0,1,2,4")
 p.add_argument("--full-range", action="store_true", help="动作按关节各自裁到够得着整个活动范围(默认统一裁到 ±1.5, 膝盖最多弯 73°); 起身用")
 p.add_argument("--sym", type=float, default=0.0, help="左右镜像约束的权重(例如 4); 0 = 不加。身体和奖励必须左右对称, 用 check_mirror.py 检查")
 a = p.parse_args()
@@ -83,9 +85,9 @@ priv += [n for n in split(a.priv_add) if n not in obs + priv]
 rng = lambda s: tuple(float(v) for v in s.split(","))
 env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy), cmd_wz=rng(a.wz), cmd_duty=rng(a.duty),
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
-               gait_period=a.gait_period, cmd_stand=a.stand, cmd_acc=a.cmd_acc or None,
+               gait_period=a.gait_period, cmd_stand=a.stand, cmd_turn=a.turn, cmd_acc=a.cmd_acc or None,
                push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
-               getup=a.getup, act_clip="full" if a.full_range else 1.5, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
+               getup=a.getup, getup_classes=[int(x) for x in a.getup_classes.split(',')] if a.getup_classes else None, act_clip="full" if a.full_range else 1.5, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 
 env = HumanoidEnv(a.envs, seed=a.seed, **env_cfg)
 ppo = PPO(env, T=a.T, epochs=a.epochs, minibatches=a.mb, lr=a.lr, critic_lr=a.critic_lr, ent=a.ent, init_std=a.init_std, sym=a.sym, bound=a.bound, kl_target=a.kl)

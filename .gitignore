@@ -9,3 +9,6 @@ runs/**/stdout.log
 
 # 回放每个约 2.5 MB, 随时可以用 export.py 重新导出
 web/replays/
+
+# 网页互动版: cpu_check.py --dump 生成的对比轨迹
+web/play/ref_trace.json
