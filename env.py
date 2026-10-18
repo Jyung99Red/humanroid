@@ -70,6 +70,7 @@ REWARD = dict(
     getup_stage=0.0,   # 分阶段模仿起身(> 0 时打开, 是每个阶段的基础分): 0 翻成趴着 -> 1 撑成四肢着地(跟踪关键姿势 FOURS_*) -> 2 站起来(上面几项)。
                        # 阶段越靠后基础分越高, 停在半路不划算。只靠奖励时手几乎不撑地(getup7~12), 这里把"手撑着起来"写成必经的关键姿势。例如 1.0
     getup_track=1.0,   # 阶段 0 / 1 里跟关键姿势像不像的那部分(0~1)的权重
+    getup_width=0.0,   # 起身时两脚左右间距(朝向坐标系)超过 GETUP_WIDTH_MAX 的部分(米)平方罚。不加时 getup17 起身中两脚分开 1.3 米(快横劈叉), 例如 10
     getup_stand=2.0,   # 站起来了(高度 > 90%、立直、只有脚着地)以后: 一半看不动(水平速度小), 一半看姿态接近默认站姿(交给走路策略时好接)
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
@@ -82,6 +83,7 @@ FOURS_PITCH = 1.19         # 四肢着地的关键姿势: 躯干前倾 68°, 手
 FOURS_Z = 0.60            # 四肢着地时躯干(根)的高度, 米(姿态库里实测中位数)
 FOURS_HOLD = 5            # 和关键姿势够像(三项都 > FOURS_SIM)连续这么多步, 进入"站起来"阶段
 FOURS_SIM = 0.6
+GETUP_WIDTH_MAX = 0.35    # 米, 起身时两脚左右间距上限(真人从蹲到站约与肩同宽 30~40 cm)
 GETUP_MAX_V = 1.0         # m/s, 起身时躯干速度上限(超过才罚)
 GETUP_MAX_W = 4.0         # rad/s, 起身时躯干角速度上限
 PUSH_GRACE = 1.0          # 秒, 被推之后多久内不按步态时钟奖励节奏
@@ -714,6 +716,12 @@ class HumanoidEnv:
             # 只在躯干正在往上升时给, 按上升速度(0.5 m/s 封顶): 撑着不动拿不到(getup9 只要求"坐起来 + 手撑地", 趴着的学会撑起上身就不起来了)
             self.m_hand = (self.qpos[:, 2] < GETUP_HAND_Z * self.root_z0) & bg[:, :2].any(dim=1)
             r = r + rw["getup_hand"] * self.m_hand * bg[:, :2].float().mean(dim=1) * (self.qvel[:, 2].clamp(0, 0.5) / 0.5)
+        if rw["getup_width"]:
+            q = self.qpos[:, 3:7]
+            yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+            d = self.xpos[:, self.foot_ids[1], :2] - self.xpos[:, self.foot_ids[0], :2]
+            self.m_width = (-torch.sin(yaw) * d[:, 0] + torch.cos(yaw) * d[:, 1]).abs()
+            r = r - rw["getup_width"] * (self.m_width - GETUP_WIDTH_MAX).clamp(min=0) ** 2
         if rw["getup_air"]:
             r = r - rw["getup_air"] * (~fell & (self.contact.sum(dim=1) == 0)).float()
         if rw["getup_speed"]:

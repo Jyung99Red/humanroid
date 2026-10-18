@@ -38,6 +38,7 @@ t_up = torch.full((a.n,), float("inf"), device=env.dev)
 lost = torch.zeros(a.n, dtype=torch.bool, device=env.dev)            # 站起来以后又倒了(身体碰地)
 cls = env.fallen_cls.to(env.dev)[env.getup_pick]
 air, vmax, wmax, hand, rise, prop = (torch.zeros(a.n, device=env.dev) for _ in range(6))   # 起身过程中(站起来之前): 腾空秒数、躯干速度峰值、角速度峰值、手撑地秒数、用时
+width = torch.zeros(a.n, device=env.dev)                          # 起身过程中(躯干 > 50% 站立高度、双脚着地)两脚左右间距的最大值
 tau = torch.zeros(a.n, env.nu, device=env.dev)                     # 起身过程中各关节力矩 / 最大力矩的峰值
 tau_max = env.tau_max.to(env.dev)
 obs, _ = env.observe()
@@ -49,6 +50,12 @@ for t in range(steps):
     hand += (rising & bg[:, :2].any(dim=1)).float() * env.dt
     prop += (rising & bg[:, :2].any(dim=1) & ~bg[:, 2]).float() * env.dt          # 手撑着、躯干离地(手在承重)
     rise += rising.float() * env.dt
+    q = env.qpos[:, 3:7]
+    yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+    dxy = env.xpos[:, env.foot_ids[1], :2] - env.xpos[:, env.foot_ids[0], :2]
+    lat = (-torch.sin(yaw) * dxy[:, 0] + torch.cos(yaw) * dxy[:, 1]).abs()
+    ok_w = rising & (env.contact.sum(dim=1) == 2) & (env.qpos[:, 2] > 0.5 * env.root_z0)
+    width = torch.where(ok_w, torch.maximum(width, lat), width)
     tau = torch.where(rising[:, None], torch.maximum(tau, (env.frc[:, env.dadr] / tau_max).abs()), tau)
     vmax = torch.where(rising, torch.maximum(vmax, env.qvel[:, :3].norm(dim=1)), vmax)
     wmax = torch.where(rising, torch.maximum(wmax, env.qvel[:, 3:6].norm(dim=1)), wmax)
@@ -71,6 +78,7 @@ for name, m in groups:
     med = t_up[m][ok].median().item() if ok.any() else float("nan")
     print(f"  {name:6s} {k:5d} 个 | {row} | 中位用时 {med:.2f} 秒 | 站起来后又倒 {int((lost & m).sum())}/{int(ok.sum())}"
           f" | 手碰地 {hand[m].sum() / rise[m].sum() * 100:.0f}% 的时间, 手承重(躯干离地) {prop[m].sum() / rise[m].sum() * 100:.0f}%(撑过的 {(prop[m] > 0).float().mean() * 100:.0f}%)"
+          f" | 两脚最宽 {width[m].median() * 100:.0f} cm"
           f" | 起身时腾空 {air[m].mean():.2f} 秒(有腾空的 {(air[m] > 0).float().mean() * 100:.0f}%), 躯干速度峰值 {vmax[m].median():.1f} m/s, 角速度峰值 {wmax[m].median():.1f} rad/s")
 import mujoco
 jn = [mujoco.mj_id2name(env.mjm, mujoco.mjtObj.mjOBJ_JOINT, int(j)) for j in env.mjm.actuator_trnid[:, 0]]
