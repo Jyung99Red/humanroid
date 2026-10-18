@@ -56,6 +56,7 @@ if __name__ == "__main__":
         clip_getup=t(env.act_clip), clip_walk=1.5,
         foot_bodies=env.foot_ids, torso_body=env.torso_id,
         cmd_range=dict(vx=list(cfg["cmd_vx"]), vy=list(cfg["cmd_vy"]), wz=[-a.turn_max, a.turn_max]), cmd_acc=cfg.get("cmd_acc"),
+        cmd_ellipse=bool(cfg.get("cmd_ellipse", False)),          # 前进和侧移合起来限在椭圆里(和训练一样), 网页按键组合时照这个缩
         gait_walk=gait_mid, gait_stand=[gait_mid[0], 1.0],
         hold_steps=15, stood=dict(height=0.9, up=0.9),
         walk=net(ws, a.walk), getup=net(gs, a.getup),

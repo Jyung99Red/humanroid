@@ -29,6 +29,8 @@ REWARD = dict(
     ang_vel=0.5,       # 跟踪转向速度指令
     lin_vel_fine=0.0,  # 窄的速度跟踪(误差尺度 TRACK_FINE): 宽的那项误差 0.15 m/s 只扣 9%, 动作种类一多策略就宁可跟不准。例如 1.0
     ang_vel_fine=0.0,  # 窄的转向跟踪, 同上。例如 1.0
+    lat_vel=0.0,       # 单独的侧移跟踪(只看侧移速度, 宽的误差尺度 0.25, 离得远也有梯度)。sp2 侧移只走到指令的六成: 按 reward_terms.py 拆开看, 走快时脚打滑、
+                       # 脚翻(point_slip、foot_roll)多扣的比速度跟踪多拿的还多, 慢慢走反而划算。单加这一项让走快值得, 防滑防翻的项不放松。例如 3.0
     alive=0.2,         # 活着就给一点
     clock=0.3,         # 脚的着地节奏和步态时钟对齐
     upright=1.0,       # 惩罚躯干倾斜
@@ -178,7 +180,8 @@ class HumanoidEnv:
                  act_clip=1.5, gait_period=0.8, cmd_vx=(0.4, 1.2), cmd_vy=(0.0, 0.0),
                  cmd_wz=(-0.3, 0.3), cmd_period=250, nconmax=64, njmax=160, seed=0, reward=None, random_yaw=True, arm_pose=None,
                  arm_swing_amp=0.35, obs=DEFAULT_OBS, priv=DEFAULT_PRIV, cmd_freq=None, cmd_duty=(0.5, 0.5), cmd_stand=0.0, cmd_acc=None,
-                 push_force=0.0, push_period=(100, 250), push_len=10, cmd_turn=0.0, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1, getup_classes=None):
+                 push_force=0.0, push_period=(100, 250), push_len=10, cmd_turn=0.0, getup=False, getup_poses="models/fallen_poses.pt", getup_stand_frac=0.1, getup_classes=None,
+                 cmd_ellipse=False, cmd_grace=0.0):
         self.n, self.dev = nworld, torch.device("cuda:0")
         assert not (set(obs) | set(priv)) - set(OBS_BLOCKS), f"未知观测块 {(set(obs) | set(priv)) - set(OBS_BLOCKS)}, 可用: {list(OBS_BLOCKS)}"
         self.obs_names = list(obs)
@@ -192,6 +195,10 @@ class HumanoidEnv:
         self.gait_rng = (cmd_freq or (1.0 / gait_period, 1.0 / gait_period), cmd_duty)
         self.stand_prob = cmd_stand                       # 抽指令时有这么大概率是"站定": 速度全 0、着地比例 1
         self.turn_prob = cmd_turn                         # 抽指令时有这么大概率是"原地转身": 前进、侧移为 0, 只有转向(网页里只按 Q/E 就是这样)
+        # 前进和侧移合起来限在一个椭圆里(半轴 = 各自这个方向的上限): 侧移最快时前进为 0。不限时会抽到"前进 1.2 + 侧移 0.8"这种很难的快速斜走
+        self.cmd_ellipse = cmd_ellipse
+        # 换指令后这么多秒内不按步态时钟奖励节奏(同被推之后): 否则起步要等时钟轮到该抬的那只脚, 最多等半个周期(约 0.5 秒)。0 = 不放
+        self.cmd_grace = cmd_grace
         # 指令加速度限制(m/s^2, 转向 rad/s^2 同值): 新抽的指令是目标, 实际指令每步最多变 cmd_acc * dt。None = 瞬间换(旧策略)
         self.cmd_acc = cmd_acc
         self.rw = dict(REWARD, **(reward or {}))
@@ -284,6 +291,7 @@ class HumanoidEnv:
         self.push_left = torch.zeros(nworld, dtype=torch.long, device=self.dev)   # 这次推还剩几步
         self.push_next = torch.zeros(nworld, dtype=torch.long, device=self.dev)   # 离下次推还有几步
         self.since_push = torch.full((nworld,), 10 ** 6, dtype=torch.long, device=self.dev)   # 上次推开始以来过了几步
+        self.since_cmd = torch.full((nworld,), 10 ** 6, dtype=torch.long, device=self.dev)    # 上次换指令以来过了几步(cmd_grace 用)
         self.air = torch.zeros(nworld, 2, device=self.dev)            # 两只脚各自离地了多久(秒), 着地时为 0
         self.foot_prev = torch.zeros(nworld, 2, 2, device=self.dev)     # 上一步两只脚的水平位置, 用来算打滑的速度
         self.point_prev = torch.zeros(nworld, 2, 2, 3, device=self.dev)  # 上一步两只脚的脚跟、脚尖点位置 [世界, 脚, 点, xyz]
@@ -385,6 +393,12 @@ class HumanoidEnv:
         k = idx.numel()
         for j, (lo, hi) in enumerate(self.cmd_rng):
             self.cmd_goal[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
+        if self.cmd_ellipse:                              # 落在椭圆外的按比例缩回椭圆上
+            (xlo, xhi), (ylo, yhi) = self.cmd_rng[0], self.cmd_rng[1]
+            vx, vy = self.cmd_goal[idx, 0], self.cmd_goal[idx, 1]
+            ax = torch.where(vx >= 0, torch.full_like(vx, xhi), torch.full_like(vx, -xlo)).clamp(min=1e-6)
+            ay = torch.where(vy >= 0, torch.full_like(vy, yhi), torch.full_like(vy, -ylo)).clamp(min=1e-6)
+            self.cmd_goal[idx, :2] /= ((vx / ax) ** 2 + (vy / ay) ** 2).sqrt().clamp(min=1.0)[:, None]
         for j, (lo, hi) in enumerate(self.gait_rng):
             self.gait_goal[idx, j] = lo + (hi - lo) * torch.rand(k, device=self.dev)
         if self.stand_prob > 0:
@@ -399,6 +413,7 @@ class HumanoidEnv:
         p = self.cmd_period
         self.cmd_due[idx] = p if isinstance(p, int) else torch.randint(p[0], p[1] + 1, (k,), device=self.dev)
         self.cmd_t[idx] = 0
+        self.since_cmd[idx] = 0
 
     def _push_gap(self, k):
         p = self.push_period
@@ -509,6 +524,7 @@ class HumanoidEnv:
         wp.capture_launch(self.graph)
         self.push_left = (self.push_left - 1).clamp(min=0)
         self.since_push += 1
+        self.since_cmd += 1
 
         self.t += 1
         self.cmd_t += 1
@@ -521,6 +537,31 @@ class HumanoidEnv:
         self.contact = feet.float()
         self.air = torch.where(feet, torch.zeros_like(self.air), self.air + self.dt)
 
+        r = self._walk_reward(self.rw, q, g)
+
+        if self.getup:
+            r = self._getup_reward(g, fell)
+        self.m_fell = fell
+        terminated = (fell & (not self.getup)) | ~torch.isfinite(self.qpos).all(dim=1)
+        truncated = (self.t >= self.ep_len) & ~terminated
+        done = terminated | truncated
+
+        # 超时截断不是失败: 需要用终止前的状态估价值, 所以先把"重置前"的观测留下来
+        final_critic = self._obs()[1] if truncated.any() else None
+        info = dict(final_critic=final_critic)
+
+        idx = done.nonzero(as_tuple=False).squeeze(1)
+        self.reset_idx(idx)
+        due = (self.cmd_t >= self.cmd_due) | done
+        self._sample_cmd(due.nonzero(as_tuple=False).squeeze(1))
+        if self.cmd_acc is not None:                       # 重新开局的直接用新指令, 其他的按加速度限制往目标靠
+            self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
+            self._ramp_cmd()
+        obs, critic = self._obs()
+        return obs, critic, r, terminated, truncated, info
+
+    def _walk_reward(self, rw, q, g):
+        """走路的奖励(每个世界一个数)。rw: 各项权重; reward_terms.py 用它一项一项算。会更新 foot_prev / point_prev(打滑项用)"""
         # 在"朝向对齐"的水平坐标系里比较速度, 这样躯干前倾也不会影响速度跟踪
         w, x, y, zq = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
         yaw = torch.atan2(2 * (w * zq + x * y), 1 - 2 * (y * y + zq * zq))
@@ -529,7 +570,6 @@ class HumanoidEnv:
         vx_h, vy_h = c * vx_w + s * vy_w, -s * vx_w + c * vy_w
         wz = self.qvel[:, 5]
 
-        rw = self.rw
         lin_err = (vx_h - self.cmd[:, 0]) ** 2 + (vy_h - self.cmd[:, 1]) ** 2
         self.m_lin_err, self.m_vx, self.m_vy = lin_err, vx_h, vy_h     # 给训练日志、测验看的监控量(朝向坐标系)
         r = rw["lin_vel"] * torch.exp(-lin_err / 0.25)
@@ -537,11 +577,13 @@ class HumanoidEnv:
         if rw["lin_vel_fine"] or rw["ang_vel_fine"]:       # 宽的项保证离得远时也有梯度, 窄的项管跟得准
             r = r + rw["lin_vel_fine"] * torch.exp(-lin_err / TRACK_FINE)
             r = r + rw["ang_vel_fine"] * torch.exp(-((wz - self.cmd[:, 2]) ** 2) / TRACK_FINE)
+        if rw["lat_vel"]:
+            r = r + rw["lat_vel"] * torch.exp(-((vy_h - self.cmd[:, 1]) ** 2) / 0.25)
         r = r + rw["alive"]
         # 步态时钟: 右脚在 [0, D) 该踩地, 左脚晚半个周期; D = 0.5 就是左右严格轮换, D = 1 两脚都该踩地(站)
         want = (torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0 < self.gait[:, 1:2]).float()
-        # 被推之后 PUSH_GRACE 秒内不管节奏: 要乱跨几步才稳得住(站着被推也一样)
-        grace = (self.since_push.float() * self.dt < PUSH_GRACE).float()
+        # 被推之后 PUSH_GRACE 秒内不管节奏: 要乱跨几步才稳得住(站着被推也一样); 换指令后 cmd_grace 秒内也不管(哪只脚先迈都行)
+        grace = ((self.since_push.float() * self.dt < PUSH_GRACE) | (self.since_cmd.float() * self.dt < self.cmd_grace)).float()
         r = r + rw["clock"] * (1 - grace) * (self.contact == want).float().mean(dim=1)
         if rw["stand_feet"]:
             standing = (self.gait[:, 1] > 0.99).float() * (1 - grace)
@@ -637,27 +679,7 @@ class HumanoidEnv:
             v2 = (((pts[..., :2] - self.point_prev[..., :2]) / self.dt) ** 2).sum(dim=-1).clamp(max=1.0)
             r = r - rw["point_slip"] * (on * v2).sum(dim=(1, 2)) * (self.t > 1)
             self.point_prev.copy_(pts)
-
-        if self.getup:
-            r = self._getup_reward(g, fell)
-        self.m_fell = fell
-        terminated = (fell & (not self.getup)) | ~torch.isfinite(self.qpos).all(dim=1)
-        truncated = (self.t >= self.ep_len) & ~terminated
-        done = terminated | truncated
-
-        # 超时截断不是失败: 需要用终止前的状态估价值, 所以先把"重置前"的观测留下来
-        final_critic = self._obs()[1] if truncated.any() else None
-        info = dict(final_critic=final_critic)
-
-        idx = done.nonzero(as_tuple=False).squeeze(1)
-        self.reset_idx(idx)
-        due = (self.cmd_t >= self.cmd_due) | done
-        self._sample_cmd(due.nonzero(as_tuple=False).squeeze(1))
-        if self.cmd_acc is not None:                       # 重新开局的直接用新指令, 其他的按加速度限制往目标靠
-            self.cmd[idx], self.gait[idx] = self.cmd_goal[idx], self.gait_goal[idx]
-            self._ramp_cmd()
-        obs, critic = self._obs()
-        return obs, critic, r, terminated, truncated, info
+        return r
 
     def body_ground(self):
         """起身用: 每个世界 [右手碰地, 左手碰地, 躯干碰地] [n, 3](手 = 手或前臂; 躯干 = 躯干、头、腰、胯、大腿、上臂)"""

@@ -42,6 +42,8 @@ p.add_argument("--stand", type=float, default=0.0, help="抽指令时站定(速�
 p.add_argument("--turn", type=float, default=0.0, help="抽指令时原地转身(前进、侧移为 0, 只转向)的概率, 例如 0.1")
 p.add_argument("--cmd-period", default="", help="多少秒换一次指令 lo,hi(每次随机抽), 例如 1,5; 不给就固定 5 秒")
 p.add_argument("--cmd-acc", type=float, default=0.0, help="指令加速度限制 m/s^2(转向 rad/s^2 同值), 例如 1.5; 0 = 新指令瞬间生效")
+p.add_argument("--cmd-grace", type=float, default=0.0, help="换指令后这么多秒内不按步态时钟奖励节奏(同被推之后), 例如 0.5: 起步不用等时钟轮到那只脚")
+p.add_argument("--cmd-ellipse", action="store_true", help="前进和侧移合起来限在椭圆里(半轴 = 各方向的上限): 侧移最快时前进为 0; 不限时会抽到很难的快速斜走")
 p.add_argument("--out", type=str, default="runs/walk1")
 p.add_argument("--resume", type=str, default="")
 p.add_argument("--obs-add", type=str, default="", help="给演员加观测块(逗号分隔), 例如续训时加新输入; 可用块见 env.OBS_BLOCKS")
@@ -85,7 +87,7 @@ priv += [n for n in split(a.priv_add) if n not in obs + priv]
 rng = lambda s: tuple(float(v) for v in s.split(","))
 env_cfg = dict(xml=a.xml, obs=obs, priv=priv, cmd_vx=rng(a.vx), cmd_vy=rng(a.vy), cmd_wz=rng(a.wz), cmd_duty=rng(a.duty),
                cmd_freq=rng(a.freq) if a.freq else None, ep_len=a.ep_len, action_frac=a.action_frac, reward=dict(REWARD, **rw), arm_pose=a.arm_pose or None, arm_swing_amp=a.swing_amp,
-               gait_period=a.gait_period, cmd_stand=a.stand, cmd_turn=a.turn, cmd_acc=a.cmd_acc or None,
+               gait_period=a.gait_period, cmd_stand=a.stand, cmd_turn=a.turn, cmd_acc=a.cmd_acc or None, cmd_ellipse=a.cmd_ellipse, cmd_grace=a.cmd_grace,
                push_force=a.push, push_period=tuple(int(round(float(v) / 0.02)) for v in a.push_period.split(",")),
                getup=a.getup, getup_classes=[int(x) for x in a.getup_classes.split(',')] if a.getup_classes else None, act_clip="full" if a.full_range else 1.5, cmd_period=tuple(int(round(float(v) / 0.02)) for v in a.cmd_period.split(",")) if a.cmd_period else 250)
 

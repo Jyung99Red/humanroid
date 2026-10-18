@@ -227,14 +227,19 @@ for (const b of document.querySelectorAll('#pad button')) {
 const R = ctl.c.cmd_range;
 function currentCmd() {
   const fast = keys.has('ShiftLeft') || keys.has('ShiftRight');
-  const v = fast ? R.vx[1] : +$('speed').value;
+  const v = fast ? R.vx[1] : +$('speed').value, k = fast ? 1 : 0.75;   // 按住 Shift: 各方向都到训练的上限
   let vx = 0, vy = 0, wz = 0;
   if (keys.has('KeyW')) vx += v;
-  if (keys.has('KeyS')) vx += R.vx[0] * 0.67;          // 倒退慢一点(训练到 -0.6)
-  if (keys.has('KeyA')) vy += R.vy[1] * 0.75;
-  if (keys.has('KeyD')) vy += R.vy[0] * 0.75;
+  if (keys.has('KeyS')) vx += R.vx[0] * k;
+  if (keys.has('KeyA')) vy += R.vy[1] * k;
+  if (keys.has('KeyD')) vy += R.vy[0] * k;
   if (keys.has('KeyQ')) wz += R.wz[1];
   if (keys.has('KeyE')) wz += R.wz[0];
+  if (ctl.c.cmd_ellipse) {                               // 前进 + 侧移合起来不超过椭圆(和训练一样), 斜着走时两个都缩一点
+    const ax = vx >= 0 ? R.vx[1] : -R.vx[0], ay = vy >= 0 ? R.vy[1] : -R.vy[0];
+    const r = Math.max(1, Math.hypot(vx / ax, vy / ay));
+    vx /= r; vy /= r;
+  }
   return [vx, vy, wz];
 }
 $('speed').oninput = (e) => { $('speedv').textContent = (+e.target.value).toFixed(1); };
