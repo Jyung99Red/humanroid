@@ -5,12 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>人偶互动</title>
 <style>
-  :root { --panel:rgba(16,22,34,.78); --line:rgba(255,255,255,.14); --tx:#e8eef7; --dim:#9fb0c7; --acc:#ffb347; --bad:#ff7b72; }
+  :root { --panel:rgba(16,22,34,.78); --line:rgba(255,255,255,.14); --tx:#e8eef7; --dim:#9fb0c7; --acc:#ffb347; --bad:#ff7b72; --good:#7ee787; }
   * { box-sizing:border-box; }
   html, body { margin:0; height:100%; background:#0e1420; color:var(--tx); font:14px/1.45 system-ui, "Microsoft YaHei", sans-serif; overflow:hidden; }
   canvas#c { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
   .panel { position:fixed; background:var(--panel); border:1px solid var(--line); border-radius:12px; backdrop-filter:blur(8px); }
-  #top { top:calc(12px + env(safe-area-inset-top, 0px)); left:12px; padding:10px 14px; max-width:min(380px, calc(100vw - 24px)); }
+  #hud { position:fixed; top:calc(12px + env(safe-area-inset-top, 0px)); left:12px; right:12px; display:flex; justify-content:space-between; align-items:flex-start; gap:8px 12px; pointer-events:none; }
+  #hud > .panel { position:relative; pointer-events:auto; }
+  @media (max-width:759px) { #hud { flex-direction:column; align-items:stretch; } #gun summary span { display:none; } }
+  #top { padding:10px 14px; max-width:380px; }
   #top h1 { margin:0 0 4px; font-size:15px; font-weight:600; }
   #top p { margin:0; color:var(--dim); font-size:12px; }
   #stat { margin-top:8px; display:grid; grid-template-columns:auto 1fr; gap:2px 10px; font-variant-numeric:tabular-nums; }
@@ -26,6 +29,36 @@
   label.sl input { accent-color:var(--acc); width:110px; }
   .sep { flex:1 1 auto; }
   #msg { position:fixed; inset:0; display:grid; place-items:center; text-align:center; color:var(--dim); padding:24px; pointer-events:none; }
+  /* 发球机面板 */
+  #gun { width:300px; max-width:100%; padding:0; }
+  @media (max-width:759px) { #top, #gun { max-width:none; width:auto; } }
+  #gun summary { list-style:none; cursor:pointer; padding:10px 14px; display:flex; align-items:baseline; gap:8px; user-select:none; }
+  #gun summary::-webkit-details-marker { display:none; }
+  #gun summary b { font-size:15px; font-weight:600; }
+  #gun summary span { color:var(--dim); font-size:12px; }
+  #gun summary::after { content:'▾'; margin-left:auto; color:var(--dim); }
+  #gun:not([open]) summary::after { content:'▸'; }
+  #gun .body { padding:0 14px 12px; display:grid; gap:8px; }
+  #gun .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  #fire { flex:1 1 auto; font-weight:600; border-color:var(--acc); background:rgba(255,179,71,.22); padding:8px 12px; }
+  #fire:active { background:rgba(255,179,71,.4); }
+  .seg { display:flex; gap:4px; flex-wrap:wrap; }
+  .seg button { padding:4px 9px; font-size:13px; }
+  .kinds { display:grid; grid-template-columns:1fr 1fr; gap:4px; }
+  .kinds button { display:flex; align-items:center; gap:6px; padding:5px 8px; font-size:13px; text-align:left; }
+  .kinds small { color:var(--dim); margin-left:auto; font-variant-numeric:tabular-nums; }
+  .dot { width:12px; height:12px; border-radius:50%; flex:none; box-shadow:inset -2px -2px 3px rgba(0,0,0,.35); }
+  .grid2 { display:grid; grid-template-columns:auto 1fr auto; gap:4px 8px; align-items:center; color:var(--dim); font-size:13px; }
+  .grid2 input[type=range] { accent-color:var(--acc); width:100%; min-width:0; }
+  .grid2 output { font-variant-numeric:tabular-nums; color:var(--tx); min-width:4.2em; text-align:right; }
+  .k2 { color:var(--dim); font-size:13px; min-width:2.6em; }
+  .checks { display:flex; gap:14px; color:var(--dim); font-size:13px; }
+  .checks input { accent-color:var(--acc); }
+  #gstat { font-variant-numeric:tabular-nums; font-size:13px; border-top:1px solid var(--line); padding-top:8px; display:flex; flex-wrap:wrap; gap:2px 12px; }
+  #gstat .k { color:var(--dim); }
+  #hitmsg { min-height:1.4em; font-size:13px; color:var(--dim); }
+  #hitmsg.flash { animation:flash .9s ease-out; }
+  @keyframes flash { 0% { color:#fff; transform:scale(1.08); } 100% { color:var(--dim); transform:scale(1); } }
   [hidden] { display:none !important; }
 </style>
 <script type="importmap">{"imports":{"three":"../vendor/three.module.js","three/addons/":"../vendor/"}}</script>
@@ -33,15 +66,35 @@
 <body>
 <canvas id="c"></canvas>
 <div id="msg">加载物理引擎和策略网络…</div>
+<div id="hud">
 <div class="panel" id="top">
   <h1>人偶互动 <a href="../index.html" style="color:var(--acc);font-size:13px;font-weight:400;margin-left:8px">训练回放 →</a></h1>
-  <p>WASD / 方向键走，Q / E 转身，按住 Shift 走快；在人身上按住鼠标往一个方向拖，松开就朝那个方向推（拖得越长越用力）。物理是 MuJoCo（浏览器里跑），动作全由训练好的策略网络决定，倒了会自己爬起来。</p>
+  <p>WASD / 方向键走，Q / E 转身，按住 Shift 走快；在人身上按住鼠标往一个方向拖，松开就朝那个方向推（拖得越长越用力）；发球机朝它扔球（F 发一个，G 开关自动，P 暂停）。物理是 MuJoCo（浏览器里跑），动作全由训练好的策略网络决定，倒了会自己爬起来。</p>
   <div id="stat">
     <span class="k">状态</span><span id="mode">—</span>
     <span class="k">指令</span><span id="cmd">站定</span>
     <span class="k">摔倒 / 起身</span><span id="falls">0 / 0</span>
     <span class="k">推力</span><span id="force">—</span>
   </div>
+</div>
+<details class="panel" id="gun" open>
+  <summary><b>发球机</b><span>F 发一个 · G 自动</span></summary>
+  <div class="body">
+    <div class="row"><button id="fire">发球</button><button id="auto">自动发球</button></div>
+    <div class="kinds" id="kinds"></div>
+    <div class="grid2">
+      <span>速度</span><input id="bspeed" type="range" min="6" max="30" step="1" value="14"><output id="bspeedv">14 m/s</output>
+      <span>距离</span><input id="bdist" type="range" min="3" max="12" step="0.5" value="7"><output id="bdistv">7 m</output>
+      <span>间隔</span><input id="bint" type="range" min="0.4" max="4" step="0.1" value="1.5"><output id="bintv">1.5 s</output>
+      <span>散布</span><input id="bspread" type="range" min="0" max="50" step="1" value="8"><output id="bspreadv">8 cm</output>
+    </div>
+    <div class="row"><span class="k2">瞄准</span><div class="seg" id="aimseg"><button data-v="head">头</button><button data-v="torso" class="on">躯干</button><button data-v="legs">腿</button><button data-v="rand">随机</button></div></div>
+    <div class="row"><span class="k2">位置</span><div class="seg" id="posseg"><button data-v="far" class="on">镜头对面</button><button data-v="side">侧面</button><button data-v="rand">四面八方</button></div></div>
+    <div class="checks"><label><input type="checkbox" id="lead" checked> 提前量</label><label><input type="checkbox" id="showpath" checked> 显示弹道</label></div>
+    <div id="gstat"><span><span class="k">发出</span> <b id="nthrown">0</b></span><span><span class="k">命中</span> <b id="nhit">0</b></span><span><span class="k">没打中</span> <b id="nmiss">0</b></span><span><span class="k">打倒</span> <b id="nknock">0</b></span></div>
+    <div id="hitmsg">球落地前直接打到人才算命中</div>
+  </div>
+</details>
 </div>
 <div class="panel" id="bar">
   <div id="pad" aria-label="方向">
@@ -54,6 +107,7 @@
   <button id="shove">随机推一下</button>
   <button id="knock">推倒它</button>
   <button id="slow">慢放</button>
+  <button id="pause">暂停</button>
   <button id="reset">重来</button>
 </div>
 
@@ -62,9 +116,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { makeMats, dressCharacter, updateLinks } from '../character.js';
 import loadMujoco from '../vendor/mujoco/mujoco.js';
-import { Controller } from './sim.js';
+import { Controller, aim } from './sim.js';
 
 const $ = (id) => document.getElementById(id);
+if (innerWidth < 760) $('gun').open = false;             // 手机上先收起来, 点标题展开
 
 // ---------- 场景(同回放页面) ----------
 const renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true });
@@ -88,7 +143,7 @@ camera.position.set(2.6, 1.7, 3.6); controls.target.set(0, 0.9, 0);
 scene.add(new THREE.HemisphereLight(0xe4f0ff, 0x6e7a58, 1.05));
 const sun = new THREE.DirectionalLight(0xfff0dc, 2.4);
 sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004;
-Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 50 });
+Object.assign(sun.shadow.camera, { left: -10, right: 10, top: 10, bottom: -10, near: 1, far: 50 });
 scene.add(sun, sun.target);
 const ground = (() => {
   const c = document.createElement('canvas'); c.width = c.height = 256;
@@ -99,37 +154,45 @@ const ground = (() => {
   const m = new THREE.Mesh(new THREE.PlaneGeometry(400, 400).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ map: t, roughness: 0.96 }));
   m.receiveShadow = true; scene.add(m); return m;
 })();
-// MuJoCo 是 Z 轴朝上: 人形放进绕 X 轴转 -90° 的组里。three (x, y, z) = MuJoCo (x, z, -y)
+// MuJoCo 是 Z 轴朝上: 人形和球放进绕 X 轴转 -90° 的组里。three (x, y, z) = MuJoCo (x, z, -y)
 const mjGroup = new THREE.Group(); mjGroup.rotation.x = -Math.PI / 2; scene.add(mjGroup);
+const ballGroup = new THREE.Group(); ballGroup.rotation.x = -Math.PI / 2; scene.add(ballGroup);   // 单独一组: 拖拽推人时射线只打人形
 const toThree = (x, y, z) => new THREE.Vector3(x, z, -y);
 
 // ---------- 物理 + 策略 ----------
-let ctl, W, nb;
+let ctl, W, nb, BALLS;
 try {
-  const [mujoco, cfg] = await Promise.all([loadMujoco(), fetch('policies.json').then((r) => { if (!r.ok) throw new Error('找不到 policies.json, 先运行 export_web.py'); return r.json(); })]);
+  const json = (u, hint) => fetch(u).then((r) => { if (!r.ok) throw new Error(hint); return r.json(); });
+  const [mujoco, cfg, balls] = await Promise.all([loadMujoco(), json('policies.json', '找不到 policies.json, 先运行 export_web.py'), json('balls.json', '找不到 balls.json')]);
   const xml = await (await fetch(cfg.xml)).text();
-  ctl = new Controller(mujoco, xml, cfg);
+  ctl = new Controller(mujoco, xml, cfg, balls);
+  BALLS = balls;
   const m = ctl.m;
+  nb = ctl.nbh;                                          // 只画人形的刚体, 球另外画
   // 刚体和几何体的清单(格式同 export.py 的 model_info), 给 dressCharacter 用
   const data = { bodies: [], geoms: [] };
-  for (let i = 0; i < m.nbody; i++) data.bodies.push({ name: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY.value, i), parent: m.body_parentid[i] });
+  for (let i = 0; i < nb; i++) data.bodies.push({ name: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY.value, i), parent: m.body_parentid[i] });
   const T = { [mujoco.mjtGeom.mjGEOM_SPHERE.value]: 'sphere', [mujoco.mjtGeom.mjGEOM_CAPSULE.value]: 'capsule' };
   for (let g = 0; g < m.ngeom; g++) {
-    if (m.geom_type[g] === mujoco.mjtGeom.mjGEOM_PLANE.value) continue;
+    if (m.geom_type[g] === mujoco.mjtGeom.mjGEOM_PLANE.value || m.geom_bodyid[g] >= nb) continue;
     data.geoms.push({ body: m.geom_bodyid[g], type: T[m.geom_type[g]], size: [m.geom_size[g * 3], m.geom_size[g * 3 + 1]],
                       pos: Array.from(m.geom_pos.slice(g * 3, g * 3 + 3)), quat: Array.from(m.geom_quat.slice(g * 4, g * 4 + 4)) });
   }
-  nb = m.nbody;
   const wg = new THREE.Group(); mjGroup.add(wg);
   const bodyObjs = data.bodies.map(() => { const o = new THREE.Object3D(); wg.add(o); return o; });
   const { links } = dressCharacter(data, bodyObjs, makeMats(0x3e8bff));
-  W = { bodyObjs, links, prevPos: new Float64Array(nb * 3), prevQuat: new Float64Array(nb * 4) };
-  snapshot();
-  $('msg').hidden = true;
+  W = { bodyObjs, links, prevPos: new Float64Array(m.nbody * 3), prevQuat: new Float64Array(m.nbody * 4), prevBall: new Float64Array(ctl.balls.length * 7),
+        names: data.bodies.map((b) => b.name), body: (n) => data.bodies.findIndex((b) => b.name === n) };
   window.__play = { ctl, THREE, camera, controls, mujoco, mjGroup, scene };
 } catch (e) { $('msg').textContent = '加载失败: ' + (e.message || e); console.error(e); throw e; }
 
-function snapshot() { W.prevPos.set(ctl.d.xpos); W.prevQuat.set(ctl.d.xquat); }   // 物理步之前的姿态, 画面在两步之间插值
+function snapshot() {                                    // 物理步之前的姿态, 画面在两步之间插值
+  W.prevPos.set(ctl.d.xpos); W.prevQuat.set(ctl.d.xquat);
+  const q = ctl.d.qpos;
+  ctl.balls.forEach((b, i) => W.prevBall.set(q.subarray(b.qadr, b.qadr + 7), i * 7));
+}
+snapshot();
+$('msg').hidden = true;
 
 const qa = new THREE.Quaternion(), qb = new THREE.Quaternion();
 function drawBody(alpha) {
@@ -146,7 +209,13 @@ function drawBody(alpha) {
 // ---------- 指令: 键盘 + 屏幕按钮 ----------
 const keys = new Set();
 const KEYMAP = { ArrowUp: 'KeyW', ArrowDown: 'KeyS', ArrowLeft: 'KeyA', ArrowRight: 'KeyD' };
-addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT') return; keys.add(KEYMAP[e.code] || e.code); if (e.code.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  keys.add(KEYMAP[e.code] || e.code); if (e.code.startsWith('Arrow')) e.preventDefault();
+  if (!e.repeat && e.code === 'KeyF') fire();
+  if (!e.repeat && e.code === 'KeyG') setAuto(!gun.auto);
+  if (!e.repeat && e.code === 'KeyP') setPause(!paused);
+});
 addEventListener('keyup', (e) => { keys.delete(KEYMAP[e.code] || e.code); });
 addEventListener('blur', () => keys.clear());
 for (const b of document.querySelectorAll('#pad button')) {
@@ -222,24 +291,259 @@ function pushRandom(mag) {
 }
 $('shove').onclick = () => pushRandom(Math.min(250, +$('pmax').value));
 $('knock').onclick = () => pushRandom(600);
-$('reset').onclick = () => { ctl.resetStanding(); snapshot(); };
 let slow = false;
 $('slow').onclick = () => { slow = !slow; $('slow').classList.toggle('on', slow); };
+let paused = false;
+function setPause(on) { paused = on; $('pause').classList.toggle('on', on); $('pause').textContent = on ? '继续' : '暂停'; }
+$('pause').onclick = () => setPause(!paused);
+
+// ---------- 球: 外观(只影响画面; 大小、质量、弹性在 balls.json) ----------
+const LOOKS = {                                          // 颜色, 花纹: 'seam' 两道白缝 / 'basket' 篮球黑线 / 'band' 一圈色带 / null 光面金属
+  dodge: { color: '#e5483c', pattern: 'seam', rough: 0.55 },
+  basket: { color: '#d9752b', pattern: 'basket', rough: 0.7 },
+  medicine: { color: '#3c4047', pattern: 'band', band: '#e8c33c', rough: 0.85 },
+  shot: { color: '#5d6168', pattern: null, rough: 0.32, metal: 0.85 },
+};
+function ballTexture(L) {                               // 球面展开图(经纬度): 转起来看得出来
+  const c = document.createElement('canvas'); c.width = 256; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = L.color; g.fillRect(0, 0, 256, 128);
+  for (let i = 0; i < 900; i++) { g.fillStyle = `rgba(0,0,0,${Math.random() * 0.08})`; g.fillRect(Math.random() * 256, Math.random() * 128, 2, 2); }   // 颗粒
+  const curve = (f, w, col) => { g.strokeStyle = col; g.lineWidth = w; g.beginPath(); for (let x = 0; x <= 256; x += 4) { const y = f(x / 256); x ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke(); };
+  if (L.pattern === 'seam') { curve((u) => 64 + 34 * Math.sin(2 * Math.PI * u), 3, '#f6f1e8'); curve((u) => 64 - 34 * Math.sin(2 * Math.PI * u), 3, '#f6f1e8'); }
+  if (L.pattern === 'basket') {
+    curve(() => 64, 3, '#1b1b1b');
+    for (const x of [0, 128, 256]) { g.fillStyle = '#1b1b1b'; g.fillRect(x - 1.5, 0, 3, 128); }
+    curve((u) => 64 - 46 * Math.cos(2 * Math.PI * u), 3, '#1b1b1b');
+  }
+  if (L.pattern === 'band') { g.fillStyle = L.band; for (const x of [40, 168]) g.fillRect(x, 0, 22, 128); g.fillRect(0, 58, 256, 12); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const outlineMat = makeMats(0).outline;
+const ballMats = BALLS.kinds.map((k) => {
+  const L = LOOKS[k.id] || { color: '#cccccc', pattern: null, rough: 0.5 };
+  return new THREE.MeshStandardMaterial({ map: L.pattern ? ballTexture(L) : null, color: L.pattern ? 0xffffff : L.color, roughness: L.rough, metalness: L.metal || 0 });
+});
+const ballGeos = BALLS.kinds.map((k) => new THREE.SphereGeometry(k.r, 28, 18));
+const TRAIL = 9;                                         // 拖尾: 最近几帧的位置
+const ballObjs = ctl.balls.map((b) => {
+  const mesh = new THREE.Mesh(ballGeos[b.kind], ballMats[b.kind]); mesh.castShadow = true; mesh.visible = false;
+  mesh.add(new THREE.Mesh(ballGeos[b.kind], outlineMat));
+  ballGroup.add(mesh);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL * 3), 3));
+  const trail = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 })); trail.visible = false; trail.frustumCulled = false;
+  ballGroup.add(trail);
+  return { mesh, trail, pts: [], born: 0 };
+});
+const LIFE = 10;                                         // 扔出去 10 秒后收回(最后 0.4 秒缩小)
+function drawBalls(alpha) {
+  const q = ctl.d.qpos, P = W.prevBall;
+  ctl.balls.forEach((b, i) => {
+    const o = ballObjs[i], st = ctl.ballState[i];
+    o.mesh.visible = st !== 0;
+    if (!st) { o.trail.visible = false; return; }
+    const a = b.qadr, p = i * 7;
+    o.mesh.position.set(P[p] + (q[a] - P[p]) * alpha, P[p + 1] + (q[a + 1] - P[p + 1]) * alpha, P[p + 2] + (q[a + 2] - P[p + 2]) * alpha);
+    qa.set(P[p + 4], P[p + 5], P[p + 6], P[p + 3]); qb.set(q[a + 4], q[a + 5], q[a + 6], q[a + 3]);
+    o.mesh.quaternion.slerpQuaternions(qa, qb, alpha);
+    const age = simTime - o.born;
+    o.mesh.scale.setScalar(Math.min(1, Math.max(0.01, (LIFE - age) / 0.4)));
+    const lastPt = o.pts[o.pts.length - 1];
+    if (!lastPt || lastPt.distanceToSquared(o.mesh.position) > 1e-8) { o.pts.push(o.mesh.position.clone()); if (o.pts.length > TRAIL) o.pts.shift(); }   // 暂停时拖尾不缩
+    const v = ctl.d.qvel, speed = Math.hypot(v[b.dadr], v[b.dadr + 1], v[b.dadr + 2]);
+    o.trail.visible = speed > 4 && o.pts.length > 1;
+    if (o.trail.visible) {
+      const arr = o.trail.geometry.attributes.position;
+      for (let k = 0; k < TRAIL; k++) { const pt = o.pts[Math.max(0, o.pts.length - TRAIL + k)] || o.pts[0]; arr.setXYZ(k, pt.x, pt.y, pt.z); }
+      arr.needsUpdate = true;
+    }
+  });
+}
+
+// ---------- 发球机: 在人周围一圈上, 按弹道(含空气阻力、提前量)瞄准 ----------
+const gun = { auto: false, kind: 0, aim: 'torso', pos: 'far', phi: 0, phiGoal: 0, r: 7, part: 'torso', last: -1e9, recoil: 0, yaw: 0, pitch: 0.1,
+              thrown: 0, hit: 0, miss: 0, knock: 0, lastHit: -1e9, falls: 0 };
+const MUZZLE = 1.0, BARREL = 0.6;                        // 炮管转轴离地 1 米, 出球点在转轴前 0.6 米
+const gunObj = (() => {
+  const g = new THREE.Group(), mat = (c, r = 0.55, m = 0.2) => new THREE.MeshStandardMaterial({ color: c, roughness: r, metalness: m });
+  const add = (parent, geo, m, pos) => { const o = new THREE.Mesh(geo, m); o.position.set(...pos); o.castShadow = true; parent.add(o); return o; };
+  add(g, new THREE.CylinderGeometry(0.3, 0.36, 0.1, 28), mat(0x2e3440), [0, 0.05, 0]);
+  add(g, new THREE.CylinderGeometry(0.045, 0.05, 0.78, 16), mat(0x8a93a3, 0.35, 0.6), [0, 0.49, 0]);
+  const yaw = new THREE.Group(); yaw.position.y = MUZZLE - 0.1; g.add(yaw);
+  add(yaw, new THREE.BoxGeometry(0.36, 0.26, 0.32), mat(0xff9f2e, 0.45), [-0.06, 0, 0]);
+  const hopper = add(yaw, new THREE.CylinderGeometry(0.19, 0.08, 0.2, 24, 1, true), new THREE.MeshStandardMaterial({ color: 0xcfe3ff, roughness: 0.2, transparent: true, opacity: 0.35, side: THREE.DoubleSide }), [-0.08, 0.23, 0]);
+  hopper.castShadow = false;
+  const pitch = new THREE.Group(); pitch.position.y = 0.1; yaw.add(pitch);
+  const barrel = new THREE.Group(); pitch.add(barrel);
+  add(barrel, new THREE.CylinderGeometry(0.135, 0.15, 0.5, 28, 1, true).rotateZ(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x3b4252, roughness: 0.5, metalness: 0.3, side: THREE.DoubleSide }), [0.3, 0, 0]);
+  add(barrel, new THREE.TorusGeometry(0.14, 0.022, 10, 28).rotateY(Math.PI / 2), mat(0xff9f2e, 0.45), [0.55, 0, 0]);
+  const next = new THREE.Mesh(ballGeos[0], ballMats[0]); next.position.set(-0.08, 0.25, 0); yaw.add(next);   // 料斗里下一个球
+  scene.add(g);
+  return { g, yaw, pitch, barrel, next };
+})();
+// 弹道预览(虚线)和瞄准点(小圈)
+const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: 0xfff1c2, dashSize: 0.12, gapSize: 0.08, transparent: true, opacity: 0.8 }));
+pathLine.frustumCulled = false; ballGroup.add(pathLine);
+const aimMark = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.012, 8, 32), new THREE.MeshBasicMaterial({ color: 0xff5a4f, transparent: true, opacity: 0.9, depthTest: false }));
+aimMark.renderOrder = 10; scene.add(aimMark);
+
+const PART_NAME = { torso: '胸口', head: '头', waist_lower: '腰', pelvis: '胯', thigh: '大腿', shin: '小腿', foot: '脚', upper_arm: '上臂', lower_arm: '前臂', hand: '手' };
+function partLabel(name) {
+  const side = name.endsWith('_right') ? '右' : name.endsWith('_left') ? '左' : '';
+  return side + (PART_NAME[name.replace(/_(right|left)$/, '')] || name);
+}
+const ids = { head: W.body('head'), torso: ctl.c.torso_body, shinR: W.body('shin_right'), shinL: W.body('shin_left') };
+function partPoint(part) {                               // 瞄准点(MuJoCo 世界系)
+  const x = ctl.d.xpos, p = (b) => [x[b * 3], x[b * 3 + 1], x[b * 3 + 2]];
+  if (part === 'head') return p(ids.head);
+  if (part === 'legs') { const a = p(ids.shinR), b = p(ids.shinL); return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2]; }   // 两个膝盖中间
+  return p(ids.torso);
+}
+const pickPart = () => gun.aim === 'rand' ? ['head', 'torso', 'legs'][Math.floor(Math.random() * 3)] : gun.aim;
+const lead = [0, 0];                                     // 躯干水平速度(平滑过), 打提前量用
+const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+function plan(target) {                                  // 从炮口打 target(可带散布), 返回 {src, vel, t, ok, dst}
+  const t = ctl.c.torso_body * 3, cx = ctl.d.xpos[t], cy = ctl.d.xpos[t + 1];
+  const gx = cx + gun.r * Math.cos(gun.phi), gy = cy + gun.r * Math.sin(gun.phi);
+  const kind = gun.kind, drag = ctl.balls[kind * BALLS.per_kind].drag, speed = +$('bspeed').value, useLead = $('lead').checked;
+  let dst = target, res = null;
+  for (let k = 0; k < 3; k++) {                          // 提前量: 飞行时间和落点互相依赖, 迭代几次
+    const dx = dst[0] - gx, dy = dst[1] - gy, d = Math.hypot(dx, dy) || 1;
+    const src = [gx + dx / d * BARREL, gy + dy / d * BARREL, MUZZLE];
+    res = aim(src, dst, speed, drag, ctl.dt, ctl.c.decimation, 9.81);
+    res.src = src;
+    dst = useLead ? [target[0] + lead[0] * res.t, target[1] + lead[1] * res.t, target[2]] : target;
+  }
+  res.dst = dst;
+  return res;
+}
+function fire() {
+  const sp = +$('bspread').value / 100, p = partPoint(gun.part);
+  const target = [p[0] + gauss() * sp, p[1] + gauss() * sp, p[2] + gauss() * sp];
+  const s = plan(target);
+  const spin = [gauss() * 4, gauss() * 4, gauss() * 4];
+  const i = ctl.throwBall(gun.kind, s.src, s.vel, spin);
+  const q = ctl.d.qpos, b = ctl.balls[i];
+  W.prevBall.set(q.subarray(b.qadr, b.qadr + 7), i * 7);   // 刚扔出的球不从高空插值过来
+  ballObjs[i].pts = []; ballObjs[i].born = simTime;
+  gun.thrown++; gun.last = simTime; gun.recoil = 1;
+  gun.part = pickPart();
+  if (gun.pos === 'rand') gun.phiGoal = Math.random() * 2 * Math.PI;
+  updateGunStats();
+}
+function setAuto(on) { gun.auto = on; $('auto').classList.toggle('on', on); $('auto').textContent = on ? '停止自动' : '自动发球'; gun.last = simTime; }
+function updateGunStats() {
+  $('nthrown').textContent = gun.thrown; $('nhit').textContent = gun.hit; $('nmiss').textContent = gun.miss; $('nknock').textContent = gun.knock;
+}
+function hitMsg(text) { const el = $('hitmsg'); el.textContent = text; el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
+// 命中时在打到的地方闪一圈
+const bursts = Array.from({ length: 6 }, () => {
+  const m = new THREE.Mesh(new THREE.RingGeometry(0.06, 0.09, 32), new THREE.MeshBasicMaterial({ color: 0xfff3b0, transparent: true, depthTest: false, side: THREE.DoubleSide }));
+  m.visible = false; m.renderOrder = 11; scene.add(m); return { m, t0: -1 };
+});
+function burst(pos) { const b = bursts.reduce((a, c) => (c.t0 < a.t0 ? c : a)); b.m.position.copy(toThree(...pos)); b.t0 = performance.now(); b.m.visible = true; }
+
+// 面板
+$('kinds').innerHTML = BALLS.kinds.map((k, i) => `<button data-i="${i}" class="${i === gun.kind ? 'on' : ''}" title="半径 ${Math.round(k.r * 100)} cm"><i class="dot" style="background:${(LOOKS[k.id] || {}).color || '#ccc'}"></i>${k.name}<small>${k.mass < 1 ? k.mass.toFixed(1) : k.mass.toFixed(k.mass % 1 ? 1 : 0)} kg</small></button>`).join('');
+$('kinds').onclick = (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  gun.kind = +b.dataset.i;
+  for (const x of $('kinds').children) x.classList.toggle('on', x === b);
+  gunObj.next.geometry = ballGeos[gun.kind]; gunObj.next.material = ballMats[gun.kind];
+  gunObj.next.scale.setScalar(Math.min(1, 0.13 / BALLS.kinds[gun.kind].r));
+};
+const seg = (id, key, after) => { $(id).onclick = (e) => { const b = e.target.closest('button'); if (!b) return; gun[key] = b.dataset.v; for (const x of $(id).children) x.classList.toggle('on', x === b); after?.(); }; };
+seg('aimseg', 'aim', () => { gun.part = pickPart(); });
+seg('posseg', 'pos', () => { if (gun.pos === 'rand') gun.phiGoal = Math.random() * 2 * Math.PI; });
+for (const [id, unit] of [['bspeed', ' m/s'], ['bdist', ' m'], ['bint', ' s'], ['bspread', ' cm']]) $(id).oninput = (e) => { $(id + 'v').textContent = e.target.value + unit; };
+$('fire').onclick = fire;
+$('auto').onclick = () => setAuto(!gun.auto);
+$('reset').onclick = () => {
+  ctl.resetStanding(); snapshot();
+  Object.assign(gun, { thrown: 0, hit: 0, miss: 0, knock: 0, falls: 0, lastHit: -1e9 });
+  updateGunStats(); hitMsg('球落地前直接打到人才算命中');
+};
+
+function updateGun(real) {                              // 发球机绕着人转到该在的方位, 炮管对准下一发的出手方向
+  const t = ctl.c.torso_body * 3, cx = ctl.d.xpos[t], cy = ctl.d.xpos[t + 1];
+  const off = camera.position.clone().sub(controls.target), camPhi = Math.atan2(-off.z, off.x);   // 镜头所在的方位(MuJoCo 系)
+  if (gun.pos === 'far') gun.phiGoal = camPhi + Math.PI + 0.45;   // 人的身后偏一点: 镜头里看得见发球机, 球斜着飞过来
+  else if (gun.pos === 'side') gun.phiGoal = camPhi - Math.PI / 2 - 0.35;   // 画面左边(右上角是面板), 稍微靠后一点好看见
+  let dphi = (gun.phiGoal - gun.phi) % (2 * Math.PI);
+  if (dphi > Math.PI) dphi -= 2 * Math.PI; if (dphi < -Math.PI) dphi += 2 * Math.PI;
+  const k = gun.placed ? 1 - Math.exp(-real * 5) : 1;   // 刚打开页面时直接就位, 之后滑过去
+  gun.placed = true;
+  gun.phi += dphi * k;
+  gun.r += (+$('bdist').value - gun.r) * k;
+  const s = plan(partPoint(gun.part));
+  const h = Math.hypot(s.vel[0], s.vel[1]);
+  gun.yaw = Math.atan2(s.vel[1], s.vel[0]); gun.pitch = Math.atan2(s.vel[2], h);
+  gunObj.g.position.copy(toThree(cx + gun.r * Math.cos(gun.phi), cy + gun.r * Math.sin(gun.phi), 0));
+  gunObj.yaw.rotation.y = gun.yaw; gunObj.pitch.rotation.z = gun.pitch;
+  gun.recoil *= Math.exp(-real * 12); gunObj.barrel.position.x = -0.12 * gun.recoil;
+  // 弹道: 和瞄准同样的积分, 画到瞄准点后面一点或者落地
+  const show = $('showpath').checked;
+  pathLine.visible = aimMark.visible = show;
+  if (!show) return;
+  const pts = [], drag = ctl.balls[gun.kind * BALLS.per_kind].drag, hstep = ctl.dt / ctl.c.decimation;
+  const dist = Math.hypot(s.dst[0] - s.src[0], s.dst[1] - s.src[1]) + 0.4;
+  let [x, y, z] = s.src, [vx, vy, vz] = s.vel, v = 0;
+  for (let n = 0; n < 600; n++) {
+    if (n % ctl.c.decimation === 0) v = Math.hypot(vx, vy, vz);   // 阻力每个策略步算一次(同 aim)
+    pts.push(x, y, z);
+    if (Math.hypot(x - s.src[0], y - s.src[1]) > dist || z < 0) break;
+    vx += hstep * (-drag * v * vx); vy += hstep * (-drag * v * vy); vz += hstep * (-drag * v * vz - 9.81);
+    x += hstep * vx; y += hstep * vy; z += hstep * vz;
+  }
+  pathLine.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  pathLine.computeLineDistances();
+  pathLine.material.color.set(s.ok ? 0xfff1c2 : 0xff8a80);
+  aimMark.position.copy(toThree(...s.dst)); aimMark.lookAt(gunObj.g.position.clone().setY(MUZZLE));
+}
 
 // ---------- 主循环: 物理按真实时间跑(每 0.02 秒一个策略步), 画面在两步之间插值 ----------
 function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
 addEventListener('resize', resize); resize();
-let last = performance.now(), acc = 0, simMs = 0;
+let last = performance.now(), acc = 0, simMs = 0, simTime = 0;
 const follow = new THREE.Vector3(), tmp = new THREE.Vector3();
+function simStep() {                                     // 一个策略步 + 发球机的记账(命中、没打中、打倒、收球)
+  snapshot();
+  const live = Array.from(ctl.ballState, (s) => s === 1);
+  ctl.step(); simTime += ctl.dt;
+  lead[0] += (ctl.d.qvel[0] - lead[0]) * 0.2; lead[1] += (ctl.d.qvel[1] - lead[1]) * 0.2;
+  const hitBalls = new Set();
+  for (const [i, body, pos] of ctl.hits) {
+    hitBalls.add(i); gun.hit++; gun.lastHit = simTime;
+    burst(pos); hitMsg(`打中 ${partLabel(W.names[body])}！（${BALLS.kinds[ctl.balls[i].kind].name}）`);
+  }
+  ctl.hits.length = 0;
+  live.forEach((was, i) => { if (was && ctl.ballState[i] === 2 && !hitBalls.has(i)) gun.miss++; });
+  if (ctl.nFalls > gun.falls) {
+    if (simTime - gun.lastHit < 2) { gun.knock++; hitMsg('被球打倒了，看它爬起来'); }
+    gun.falls = ctl.nFalls;
+  }
+  ctl.balls.forEach((b, i) => { if (ctl.ballState[i] && simTime - ballObjs[i].born > LIFE) ctl.parkBall(i); });
+  if (gun.auto && simTime - gun.last >= +$('bint').value) fire();
+  updateGunStats();
+}
 function tick(now) {
   const real = Math.min((now - last) / 1000, 0.1); last = now;
   acc += real * (slow ? 0.25 : 1);
   ctl.setCmd(...currentCmd());
   const t0 = performance.now();
-  for (let k = 0; acc >= ctl.dt && k < 6; k++) { snapshot(); ctl.step(); acc -= ctl.dt; }
+  if (paused) acc = 0;
+  for (let k = 0; acc >= ctl.dt && k < 6; k++) { simStep(); acc -= ctl.dt; }
   if (acc > ctl.dt) acc = 0;                             // 掉帧太多就丢掉, 不追
   simMs = simMs * 0.9 + (performance.now() - t0) * 0.1;
-  drawBody(Math.min(acc / ctl.dt, 1));
+  const alpha = Math.min(acc / ctl.dt, 1);
+  drawBody(alpha); drawBalls(alpha);
+  updateGun(real * (slow ? 0.25 : 1));
+  for (const b of bursts) {
+    if (!b.m.visible) continue;
+    const u = (now - b.t0) / 400;
+    if (u >= 1) { b.m.visible = false; continue; }
+    b.m.scale.setScalar(1 + 4 * u); b.m.material.opacity = 1 - u; b.m.lookAt(camera.position);
+  }
   if (arrow.visible && !drag && now > arrowUntil) arrow.visible = false;
   // 镜头跟着躯干水平移动
   const p = W.bodyObjs[ctl.c.torso_body].getWorldPosition(follow);
@@ -258,6 +562,8 @@ function tick(now) {
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
+window.__play.fire = fire; window.__play.gun = gun; window.__play.simStep = simStep; window.__play.setPause = setPause;
+window.__play.draw = () => { drawBody(1); drawBalls(1); updateGun(0); renderer.render(scene, camera); };   // 测试用: 暂停时手动推几步再画一帧
 requestAnimationFrame(tick);
 </script>
 </body>

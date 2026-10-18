@@ -1,14 +1,17 @@
 """网页互动版的参考实现 + 可行性检查: 只用 export_web.py 导出的 web/play/policies.json, 在 MuJoCo 的 CPU 版(和浏览器里的 WebAssembly 同一套 C 代码)
 里跑走路 + 起身切换。训练用的是 GPU 版(MuJoCo Warp), 两者接触求解有细微差别, 策略要在这里也能用, 网页才有戏。
 web/play/sim.js 是这里 Controller 的逐行翻译; --dump 存一段轨迹(观测、动作)给 node 端对比。
+发球机的球(web/play/balls.json)也在这里: add_balls 往场景里加一池自由刚体, Controller.throw_ball 扔, aim 算出手速度。
 
     python cpu_check.py                    # 几个场景各跑若干次: 站、走(前/后/侧)、被推倒再起来、从倒地姿态起身
+    python cpu_check.py --balls            # 发球机: 每种球打躯干/头, 命中率和被打倒的比例
     python cpu_check.py --dump web/play/ref_trace.json
 """
 import argparse
 import base64
 import json
 import math
+import re
 import time
 
 import mujoco
@@ -46,13 +49,88 @@ def rotate_inverse(q, v):
     return v - w * t + np.cross(u, t)
 
 
+def add_balls(xml, spec):
+    """往场景里加一池球: 每种 per_kind 个自由刚体, 排在人形后面(人形的刚体编号、qpos 地址都不变)。
+    不用的球停在高空(gravcomp=1 抵消重力, 碰不到任何东西), 扔的时候才放下来。关键帧的 qpos 长度会对不上, 删掉(没用到)。"""
+    xml = re.sub(r"<keyframe>.*?</keyframe>", "", xml, flags=re.S)
+    fr = " ".join(str(v) for v in spec["friction"])
+    px, py, pz = spec["park"]
+    bodies, k = [], 0
+    for kd in spec["kinds"]:
+        for j in range(spec["per_kind"]):
+            bodies.append(f'<body name="ball_{kd["id"]}_{j}" pos="{px + 1.5 * k} {py} {pz}" gravcomp="1"><freejoint/>'
+                          f'<geom type="sphere" size="{kd["r"]}" mass="{kd["mass"]}" shellinertia="{str(kd["shell"]).lower()}" '
+                          f'priority="1" condim="6" friction="{fr}" solref="{kd["solref"][0]} {kd["solref"][1]}"/></body>')
+            k += 1
+    return xml.replace("</worldbody>", "".join(bodies) + "</worldbody>")
+
+
+def aim(src, dst, speed, drag, dt, dec, g):
+    """从 src 以 speed 扔到 dst(世界系)要的出手速度, 低弹道, 算上空气阻力 drag = 阻力系数 / 质量(加速度 = -drag |v| v)。
+    和 MuJoCo 里一样离散积分(阻力每个策略步算一次, 物理步半隐式欧拉)。返回 (速度, 飞行时间, 打得到吗); 打不到时给打得最高的角度"""
+    dx, dy = dst[0] - src[0], dst[1] - src[1]
+    dist = math.hypot(dx, dy)
+    ex, ey = (dx / dist, dy / dist) if dist > 1e-6 else (1.0, 0.0)
+    h = dt / dec
+
+    def fly(th):                                       # 飞到水平距离 dist 时的 (高度, 时间); 飞不到返回 None
+        vs, vz, s, z, t = speed * math.cos(th), speed * math.sin(th), 0.0, src[2], 0.0
+        while t < 3 and z > -1:
+            v = math.hypot(vs, vz)
+            a_s, a_z = -drag * v * vs, -drag * v * vz - g
+            for _ in range(dec):
+                s0, z0 = s, z
+                vs += h * a_s
+                vz += h * a_z
+                s += h * vs
+                z += h * vz
+                t += h
+                if s >= dist:
+                    f = (dist - s0) / (s - s0)
+                    return z0 + f * (z - z0), t - h * (1 - f)
+        return None
+
+    def err(th):
+        r = fly(th)
+        return -1e9 if r is None else r[0] - dst[2]
+
+    ths = [math.radians(a) for a in range(-40, 62, 2)]
+    es = [err(th) for th in ths]
+    reach = any(e >= 0 for e in es)
+    if reach:                                          # 第一个打高了的角度和前一个之间二分
+        i = next(i for i, e in enumerate(es) if e >= 0)
+        lo, hi = (ths[i - 1], ths[i]) if i > 0 else (ths[0], ths[0])
+        for _ in range(20):
+            mid = (lo + hi) / 2
+            lo, hi = (lo, mid) if err(mid) >= 0 else (mid, hi)
+        th = hi
+    else:
+        th = ths[max(range(len(ths)), key=lambda i: es[i])]
+    r = fly(th)
+    c = speed * math.cos(th)
+    return np.array([c * ex, c * ey, speed * math.sin(th)]), (r[1] if r else 3.0), reach
+
+
 class Controller:
     """一个人形: 物理(MuJoCo CPU) + 走路/起身两个策略按状态切换。和 combo.Switcher + env.HumanoidEnv.step 一致。"""
 
-    def __init__(self, cfg, xml_path):
+    def __init__(self, cfg, xml_path, balls=None):
         self.c = cfg
-        self.m = mujoco.MjModel.from_xml_path(xml_path)
+        xml = open(xml_path, encoding="utf-8").read()
+        self.m = mujoco.MjModel.from_xml_string(add_balls(xml, balls) if balls else xml)
         self.d = mujoco.MjData(self.m)
+        self.balls = []                                    # 每个球: 种类、刚体编号、qpos/qvel 地址、阻力系数 / 质量
+        if balls:
+            n = len(balls["kinds"]) * balls["per_kind"]
+            for kind, kd in enumerate(balls["kinds"]):
+                for _ in range(balls["per_kind"]):
+                    b = self.m.nbody - n + len(self.balls)
+                    jnt = self.m.body_jntadr[b]
+                    self.balls.append(dict(kind=kind, body=b, qadr=int(self.m.jnt_qposadr[jnt]), dadr=int(self.m.jnt_dofadr[jnt]),
+                                           drag=0.5 * balls["air"]["rho"] * balls["air"]["cd"] * math.pi * kd["r"] ** 2 / kd["mass"]))
+        self.nbh = self.m.nbody - len(self.balls)          # 人形(含 world)的刚体数, 球的刚体编号从这里开始
+        self.ball_state = np.zeros(len(self.balls), dtype=int)   # 0 停在高空, 1 飞行中(还没碰到东西), 2 碰过了
+        self.ball_seq = np.full(len(self.balls), -1)       # 第几个扔出去的(回收最早的那个)
         self.walk, self.getup = Net(cfg["walk"]), Net(cfg["getup"])
         for k in ("q_def", "scale", "lo", "hi", "clip_getup"):
             setattr(self, k, np.array(cfg[k]))
@@ -71,10 +149,13 @@ class Controller:
 
     def reset_pose(self, qpos):
         mujoco.mj_resetData(self.m, self.d)
-        self.d.qpos[:] = qpos
+        self.d.qpos[:len(qpos)] = qpos
         self._reset_state(mode=1)
 
     def _reset_state(self, mode):
+        for i in range(len(self.balls)):
+            self.park_ball(i)
+        self.n_thrown, self.hits = 0, []                   # hits: 球打到人的记录 (球, 刚体, 位置), 调用方取走
         self.d.ctrl[:] = self.q_def
         mujoco.mj_forward(self.m, self.d)
         self.action = np.zeros(self.m.nu)
@@ -94,8 +175,41 @@ class Controller:
     def push(self, fx, fy, steps=10):
         self.push_f[:], self.push_left = (fx, fy), steps
 
+    def throw_ball(self, kind, pos, vel, spin=(0, 0, 0)):
+        """从 pos 以速度 vel(世界系)扔一个第 kind 种的球; 优先用停着的, 都在用就回收这种球里最早扔出去的。返回球的编号"""
+        i = min((i for i, b in enumerate(self.balls) if b["kind"] == kind), key=lambda i: self.ball_seq[i])
+        b, d = self.balls[i], self.d
+        d.qpos[b["qadr"]:b["qadr"] + 7] = (*pos, 1, 0, 0, 0)
+        d.qvel[b["dadr"]:b["dadr"] + 6] = (*vel, *spin)
+        d.xfrc_applied[b["body"]] = 0
+        self.m.body_gravcomp[b["body"]] = 0
+        self.ball_state[i], self.ball_seq[i] = 1, self.n_thrown
+        self.n_thrown += 1
+        return i
+
+    def park_ball(self, i):
+        """把球收回高空"""
+        b, d = self.balls[i], self.d
+        d.qpos[b["qadr"]:b["qadr"] + 7] = self.m.qpos0[b["qadr"]:b["qadr"] + 7]
+        d.qvel[b["dadr"]:b["dadr"] + 6] = 0
+        d.xfrc_applied[b["body"]] = 0
+        self.m.body_gravcomp[b["body"]] = 1
+        self.ball_state[i], self.ball_seq[i] = 0, -1
+
+    def _ball_contacts(self):
+        """飞行中的球第一次碰到东西: 碰地算落地, 碰到人记一次命中(躲避球规则: 落过地的球不算)"""
+        for j in range(self.d.ncon):
+            con = self.d.contact[j]
+            b1, b2 = self.m.geom_bodyid[con.geom1], self.m.geom_bodyid[con.geom2]
+            for b, o in ((b1, b2), (b2, b1)):
+                i = b - self.nbh
+                if i >= 0 and self.ball_state[i] == 1 and o < self.nbh:
+                    self.ball_state[i] = 2
+                    if o > 0:
+                        self.hits.append((i, int(o), con.pos.copy()))
+
     def contacts(self):
-        """(脚以外碰地, 两只脚各自着地)"""
+        """(脚以外碰地, 两只脚各自着地)。球碰地不算"""
         fell, feet = False, [False, False]
         fid = self.c["foot_bodies"]
         for i in range(self.d.ncon):
@@ -104,6 +218,8 @@ class Controller:
             if (b1 == 0) == (b2 == 0):
                 continue
             b = b2 if b1 == 0 else b1
+            if b >= self.nbh:
+                continue
             if b == fid[0]:
                 feet[0] = True
             elif b == fid[1]:
@@ -141,8 +257,14 @@ class Controller:
         self.action = np.clip(a, -self.clip_getup, self.clip_getup)
         d.ctrl[:] = np.clip(self.q_def + self.action * self.scale, self.lo, self.hi)
         d.xfrc_applied[c["torso_body"], :2] = self.push_f if self.push_left > 0 else 0
+        for i, b in enumerate(self.balls):                 # 球的空气阻力, 每个策略步算一次
+            if self.ball_state[i]:
+                v = d.qvel[b["dadr"]:b["dadr"] + 3]
+                d.xfrc_applied[b["body"], :3] = -b["drag"] * self.m.body_mass[b["body"]] * math.sqrt(v @ v) * v
         for _ in range(c["decimation"]):
             mujoco.mj_step(self.m, d)
+            if (self.ball_state == 1).any():
+                self._ball_contacts()
         self.push_left = max(0, self.push_left - 1)
         self.phase = (self.phase + self.dt * self.gait[0]) % 1.0
         if c["cmd_acc"]:                                   # 同 env._ramp_cmd
@@ -155,6 +277,21 @@ class Controller:
         else:
             self.cmd[:], self.gait[:] = self.cmd_goal, self.gait_goal
         return o, a
+
+
+def throw_at(ctl, kind, body, speed, dist, ang, muzzle=1.0, lead=True):
+    """发球机: 在人周围 dist 米、方位角 ang、离地 muzzle 米的地方, 以 speed 把第 kind 种球扔向刚体 body;
+    lead = 按躯干现在的水平速度打提前量。和网页上的发球机一样。返回 (球的编号, 打得到吗)"""
+    c, d = ctl.c, ctl.d
+    p0 = d.xpos[body].copy()
+    tb = c["torso_body"]
+    src = np.array([d.xpos[tb][0] + dist * math.cos(ang), d.xpos[tb][1] + dist * math.sin(ang), muzzle])
+    u = np.array([d.qvel[0], d.qvel[1], 0.0]) if lead else np.zeros(3)
+    drag, g = ctl.balls[[b["kind"] for b in ctl.balls].index(kind)]["drag"], -ctl.m.opt.gravity[2]
+    tf = 0.0
+    for _ in range(3):                                 # 提前量: 飞行时间和落点互相依赖, 迭代几次
+        vel, tf, ok = aim(src, p0 + u * tf, speed, drag, ctl.dt, c["decimation"], g)
+    return ctl.throw_ball(kind, src, vel), ok
 
 
 def scenario(ctl, seq, pushes, secs):
@@ -179,10 +316,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--cfg", default="web/play/policies.json")
     p.add_argument("--trials", type=int, default=10)
-    p.add_argument("--dump", default="", help="存一段轨迹(倒地开局 → 起身 → 走 → 被推)给 node 端逐步对比")
+    p.add_argument("--dump", default="", help="存一段轨迹(倒地开局 → 起身 → 走 → 被球打 → 被推)给 node 端逐步对比")
+    p.add_argument("--balls", action="store_true", help="发球机测验: 每种球用两种速度打躯干和头, 站着和走着")
     a = p.parse_args()
     cfg = json.load(open(a.cfg))
-    ctl = Controller(cfg, f"web/play/{cfg['xml']}")
+    spec = json.load(open("web/play/balls.json", encoding="utf-8"))
+    ctl = Controller(cfg, f"web/play/{cfg['xml']}", spec)
     bank = torch.load("models/fallen_poses.pt")
     rng = np.random.default_rng(0)
     t0 = time.time()
@@ -190,16 +329,52 @@ if __name__ == "__main__":
     if a.dump:
         ctl.reset_pose(bank["qpos"][0].double().numpy())
         ctl.set_cmd(0, 0, 0)
-        tr = dict(qpos0=ctl.d.qpos.tolist(), steps=[])
+        tr = dict(qpos0=ctl.d.qpos.tolist(), steps=[], throws=[], aims=[])
+        head = mujoco.mj_name2id(ctl.m, mujoco.mjtObj.mjOBJ_BODY, "head")
         for t in range(300):
             if t == 150:
                 ctl.set_cmd(0.8, 0, 0)
             if t == 250:
                 ctl.push(0, -200)
+            if t in (200, 230):                            # 篮球打躯干(侧前方), 实心球打头(侧后方); 出手位置和速度存下来, node 端照扔
+                kind, body, ang = (1, cfg["torso_body"], 1.0) if t == 200 else (2, head, 2.5)
+                i, _ = throw_at(ctl, kind, body, 14.0, 6.0, ang)
+                b = ctl.balls[i]
+                tr["throws"].append(dict(step=t, kind=kind, pos=ctl.d.qpos[b["qadr"]:b["qadr"] + 3].tolist(), vel=ctl.d.qvel[b["dadr"]:b["dadr"] + 3].tolist()))
             o, act = ctl.step()
-            tr["steps"].append(dict(mode=ctl.mode, obs=o.round(6).tolist(), act=act.round(6).tolist(), qpos=ctl.d.qpos.round(6).tolist()))
+            tr["steps"].append(dict(mode=ctl.mode, obs=o.round(6).tolist(), act=act.round(6).tolist(), qpos=ctl.d.qpos.round(6).tolist(),
+                                    hits=len(ctl.hits)))
+        for kind, dist, dz, speed in [(0, 6, 0.3, 14), (1, 9, -0.5, 10), (2, 5, 0.6, 8), (3, 12, 0.0, 9), (0, 4, 1.0, 25)]:
+            drag = ctl.balls[kind * spec["per_kind"]]["drag"]
+            src, dst = [0.3, -0.2, 1.0], [0.3 + dist * 0.8, -0.2 + dist * 0.6, 1.0 + dz]
+            vel, tf, ok = aim(src, dst, speed, drag, ctl.dt, cfg["decimation"], 9.81)
+            tr["aims"].append(dict(src=src, dst=dst, speed=speed, drag=drag, vel=vel.tolist(), t=tf, ok=ok))
         json.dump(tr, open(a.dump, "w"))
         print("存到", a.dump)
+        raise SystemExit
+
+    if a.balls:
+        head = mujoco.mj_name2id(ctl.m, mujoco.mjtObj.mjOBJ_BODY, "head")
+        print(f"发球机离人 6 米、出手高 1 米, 方向随机, 打躯干/头; 每格 {a.trials} 次。命中 = 落地之前直接打到人; 摔倒 = 3 秒内倒地")
+        for kind, kd in enumerate(spec["kinds"]):
+            for speed in (12, 20):
+                row = []
+                for walk in (0, 0.8):
+                    for name, body in (("躯干", cfg["torso_body"]), ("头", head)):
+                        hits = falls = 0
+                        for i in range(a.trials):
+                            ctl.reset_standing()
+                            ctl.set_cmd(walk, 0, 0)
+                            for _ in range(int(1.5 / ctl.dt)):
+                                ctl.step()
+                            throw_at(ctl, kind, body, speed, 6.0, rng.uniform(0, 2 * math.pi))
+                            for _ in range(int(3 / ctl.dt)):
+                                ctl.step()
+                            hits += len(ctl.hits) > 0
+                            falls += ctl.n_falls > 0
+                        row.append(f"{'走' if walk else '站'}·{name} 中 {hits:2d} 倒 {falls:2d}")
+                print(f"{kd['name']:4s} {kd['mass']:5.2f} kg {speed:2d} m/s | " + " | ".join(row))
+        print(f"用时 {time.time() - t0:.0f} 秒")
         raise SystemExit
 
     def run(name, setup, seq, pushes, secs):

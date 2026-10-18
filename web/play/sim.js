@@ -1,7 +1,8 @@
 // 网页互动版的物理 + 策略: cpu_check.py 里 Controller 的逐行翻译(那边是参考实现, 改这里要同步改那边)。
-// 浏览器和 node 都能用: 调用方负责把 MuJoCo 模块、模型 XML 文本、policies.json(export_web.py 导出)交进来。
-//   const ctl = new Controller(mujoco, xmlText, cfg); ctl.resetStanding(); ctl.setCmd(0.8, 0, 0); ctl.step();
+// 浏览器和 node 都能用: 调用方负责把 MuJoCo 模块、模型 XML 文本、policies.json(export_web.py 导出)、balls.json(可选)交进来。
+//   const ctl = new Controller(mujoco, xmlText, cfg, balls); ctl.resetStanding(); ctl.setCmd(0.8, 0, 0); ctl.step();
 // 一个策略步 = cfg.decimation 个物理步(50 Hz)。mode: 0 走路策略, 1 起身策略。
+// 发球机: addBalls 往场景里加一池球, ctl.throwBall 扔, aim 算出手速度(都和 cpu_check.py 一致)。
 
 function f32(b64) {
   const bin = typeof atob === 'function' ? atob(b64) : Buffer.from(b64, 'base64').toString('binary');
@@ -49,11 +50,78 @@ function rotateInverse(q, v) {                         // 世界系向量 -> 机
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+// 往场景里加一池球: 每种 per_kind 个自由刚体, 排在人形后面(人形的刚体编号、qpos 地址都不变)。
+// 不用的球停在高空(gravcomp=1 抵消重力, 碰不到任何东西), 扔的时候才放下来。关键帧的 qpos 长度会对不上, 删掉(没用到)。
+export function addBalls(xml, spec) {
+  xml = xml.replace(/<keyframe>[\s\S]*?<\/keyframe>/, '');
+  const fr = spec.friction.join(' '), [px, py, pz] = spec.park;
+  let bodies = '', k = 0;
+  for (const kd of spec.kinds) {
+    for (let j = 0; j < spec.per_kind; j++, k++) {
+      bodies += `<body name="ball_${kd.id}_${j}" pos="${px + 1.5 * k} ${py} ${pz}" gravcomp="1"><freejoint/>`
+        + `<geom type="sphere" size="${kd.r}" mass="${kd.mass}" shellinertia="${kd.shell}" `
+        + `priority="1" condim="6" friction="${fr}" solref="${kd.solref[0]} ${kd.solref[1]}"/></body>`;
+    }
+  }
+  return xml.replace('</worldbody>', bodies + '</worldbody>');
+}
+
+// 从 src 以 speed 扔到 dst(世界系)要的出手速度, 低弹道, 算上空气阻力 drag = 阻力系数 / 质量(加速度 = -drag |v| v)。
+// 和 MuJoCo 里一样离散积分(阻力每个策略步算一次, 物理步半隐式欧拉)。返回 {vel, t, ok}; 打不到(ok = false)时给打得最高的角度
+export function aim(src, dst, speed, drag, dt, dec, g) {
+  const dx = dst[0] - src[0], dy = dst[1] - src[1], dist = Math.hypot(dx, dy);
+  const [ex, ey] = dist > 1e-6 ? [dx / dist, dy / dist] : [1, 0];
+  const h = dt / dec;
+  const fly = (th) => {                                // 飞到水平距离 dist 时的 [高度, 时间]; 飞不到返回 null
+    let vs = speed * Math.cos(th), vz = speed * Math.sin(th), s = 0, z = src[2], t = 0;
+    while (t < 3 && z > -1) {
+      const v = Math.hypot(vs, vz), as = -drag * v * vs, az = -drag * v * vz - g;
+      for (let k = 0; k < dec; k++) {
+        const s0 = s, z0 = z;
+        vs += h * as; vz += h * az; s += h * vs; z += h * vz; t += h;
+        if (s >= dist) { const f = (dist - s0) / (s - s0); return [z0 + f * (z - z0), t - h * (1 - f)]; }
+      }
+    }
+    return null;
+  };
+  const err = (th) => { const r = fly(th); return r === null ? -1e9 : r[0] - dst[2]; };
+  const ths = [];
+  for (let a = -40; a < 62; a += 2) ths.push(a * (Math.PI / 180));
+  const es = ths.map(err);
+  const ok = es.some((e) => e >= 0);
+  let th;
+  if (ok) {                                            // 第一个打高了的角度和前一个之间二分
+    const i = es.findIndex((e) => e >= 0);
+    let [lo, hi] = i > 0 ? [ths[i - 1], ths[i]] : [ths[0], ths[0]];
+    for (let k = 0; k < 20; k++) { const mid = (lo + hi) / 2; if (err(mid) >= 0) hi = mid; else lo = mid; }
+    th = hi;
+  } else {
+    th = ths[es.indexOf(Math.max(...es))];
+  }
+  const r = fly(th), c = speed * Math.cos(th);
+  return { vel: [c * ex, c * ey, speed * Math.sin(th)], t: r ? r[1] : 3.0, ok };
+}
+
 export class Controller {
-  constructor(mujoco, xmlText, cfg) {
+  constructor(mujoco, xmlText, cfg, balls = null) {
     this.mj = mujoco; this.c = cfg;
-    this.m = mujoco.MjModel.from_xml_string(xmlText);
+    this.m = mujoco.MjModel.from_xml_string(balls ? addBalls(xmlText, balls) : xmlText);
     this.d = new mujoco.MjData(this.m);
+    const m = this.m;
+    this.balls = [];                                   // 每个球: 种类、刚体编号、qpos/qvel 地址、阻力系数 / 质量
+    if (balls) {
+      const n = balls.kinds.length * balls.per_kind;
+      balls.kinds.forEach((kd, kind) => {
+        for (let j = 0; j < balls.per_kind; j++) {
+          const b = m.nbody - n + this.balls.length, jnt = m.body_jntadr[b];
+          this.balls.push({ kind, body: b, qadr: m.jnt_qposadr[jnt], dadr: m.jnt_dofadr[jnt],
+                            drag: 0.5 * balls.air.rho * balls.air.cd * Math.PI * kd.r ** 2 / kd.mass });
+        }
+      });
+    }
+    this.nbh = m.nbody - this.balls.length;            // 人形(含 world)的刚体数, 球的刚体编号从这里开始
+    this.ballState = new Int8Array(this.balls.length); // 0 停在高空, 1 飞行中(还没碰到东西), 2 碰过了
+    this.ballSeq = new Array(this.balls.length).fill(-1);   // 第几个扔出去的(回收最早的那个)
     this.walk = new Net(cfg.walk); this.getup = new Net(cfg.getup);
     this.nu = this.m.nu;
     this.dt = cfg.timestep * cfg.decimation;
@@ -79,6 +147,8 @@ export class Controller {
 
   _resetState(mode) {
     const { c, d } = this;
+    for (let i = 0; i < this.balls.length; i++) this.parkBall(i);
+    this.nThrown = 0; this.hits = [];                  // hits: 球打到人的记录 [球, 刚体, 位置], 调用方取走
     d.ctrl.set(c.q_def);
     this.mj.mj_forward(this.m, d);
     this.action = new Array(this.nu).fill(0);
@@ -96,7 +166,45 @@ export class Controller {
 
   push(fx, fy, steps = 10) { this.pushF = [fx, fy]; this.pushLeft = steps; }   // 推躯干(世界系, 牛), 默认 0.2 秒
 
-  contacts() {                                         // [脚以外碰地, [右脚着地, 左脚着地]]
+  throwBall(kind, pos, vel, spin = [0, 0, 0]) {        // 从 pos 以速度 vel(世界系)扔一个第 kind 种的球; 优先用停着的, 都在用就回收这种球里最早扔出去的。返回球的编号
+    let i = -1;
+    this.balls.forEach((b, j) => { if (b.kind === kind && (i < 0 || this.ballSeq[j] < this.ballSeq[i])) i = j; });
+    const b = this.balls[i], d = this.d;
+    d.qpos.set([...pos, 1, 0, 0, 0], b.qadr);
+    d.qvel.set([...vel, ...spin], b.dadr);
+    d.xfrc_applied.fill(0, b.body * 6, b.body * 6 + 6);
+    this.m.body_gravcomp[b.body] = 0;
+    this.ballState[i] = 1; this.ballSeq[i] = this.nThrown++;
+    return i;
+  }
+
+  parkBall(i) {                                        // 把球收回高空
+    const b = this.balls[i], d = this.d, m = this.m;
+    d.qpos.set(m.qpos0.subarray(b.qadr, b.qadr + 7), b.qadr);
+    d.qvel.fill(0, b.dadr, b.dadr + 6);
+    d.xfrc_applied.fill(0, b.body * 6, b.body * 6 + 6);
+    m.body_gravcomp[b.body] = 1;
+    this.ballState[i] = 0; this.ballSeq[i] = -1;
+  }
+
+  _ballContacts() {                                    // 飞行中的球第一次碰到东西: 碰地算落地, 碰到人记一次命中(躲避球规则: 落过地的球不算)
+    const vec = this.d.contact, n = this.d.ncon;
+    for (let j = 0; j < n; j++) {
+      const con = vec.get(j);
+      const b1 = this.bodyOf[con.geom1], b2 = this.bodyOf[con.geom2];
+      for (const [b, o] of [[b1, b2], [b2, b1]]) {
+        const i = b - this.nbh;
+        if (i >= 0 && this.ballState[i] === 1 && o < this.nbh) {
+          this.ballState[i] = 2;
+          if (o > 0) this.hits.push([i, o, Array.from(con.pos)]);
+        }
+      }
+      con.delete();
+    }
+    vec.delete();
+  }
+
+  contacts() {                                         // [脚以外碰地, [右脚着地, 左脚着地]]。球碰地不算
     const { d } = this, fid = this.c.foot_bodies;
     let fell = false;
     const feet = [false, false];
@@ -107,6 +215,7 @@ export class Controller {
       con.delete();
       if ((b1 === 0) === (b2 === 0)) continue;
       const b = b1 === 0 ? b2 : b1;
+      if (b >= this.nbh) continue;
       if (b === fid[0]) feet[0] = true;
       else if (b === fid[1]) feet[1] = true;
       else fell = true;
@@ -157,7 +266,17 @@ export class Controller {
     const xf = d.xfrc_applied, tb = c.torso_body * 6;
     xf[tb] = this.pushLeft > 0 ? this.pushF[0] : 0;
     xf[tb + 1] = this.pushLeft > 0 ? this.pushF[1] : 0;
-    for (let k = 0; k < c.decimation; k++) this.mj.mj_step(m, d);
+    const qvel = d.qvel;
+    this.balls.forEach((b, i) => {                     // 球的空气阻力, 每个策略步算一次
+      if (!this.ballState[i]) return;
+      const v0 = qvel[b.dadr], v1 = qvel[b.dadr + 1], v2 = qvel[b.dadr + 2];
+      const k = -b.drag * m.body_mass[b.body] * Math.sqrt(v0 * v0 + v1 * v1 + v2 * v2);
+      xf[b.body * 6] = k * v0; xf[b.body * 6 + 1] = k * v1; xf[b.body * 6 + 2] = k * v2;
+    });
+    for (let k = 0; k < c.decimation; k++) {
+      this.mj.mj_step(m, d);
+      if (this.ballState.includes(1)) this._ballContacts();
+    }
     this.pushLeft = Math.max(0, this.pushLeft - 1);
     this.phase = (this.phase + this.dt * this.gait[0]) % 1.0;
     if (c.cmd_acc) {                                   // 同 env._ramp_cmd

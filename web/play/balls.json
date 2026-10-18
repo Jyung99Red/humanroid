@@ -1,0 +1,13 @@
+{
+  "_说明": "网页发球机的球(cpu_check.py 和 web/play/sim.js 共用)。每种 per_kind 个自由刚体, 不用时停在 park 那里的高空(gravcomp 抵消重力)。solref 负数 = 直接给刚度和阻尼(会弹), 正数 = 时间常数和阻尼比(1 = 不弹)。阻力 F = 0.5 rho cd 面积 v^2",
+  "per_kind": 6,
+  "park": [0, 0, 100],
+  "air": { "rho": 1.2, "cd": 0.47 },
+  "friction": [0.6, 0.01, 0.01],
+  "kinds": [
+    { "id": "dodge", "name": "躲避球", "r": 0.1, "mass": 0.3, "shell": true, "solref": [-40000, -60] },
+    { "id": "basket", "name": "篮球", "r": 0.12, "mass": 0.62, "shell": true, "solref": [-40000, -40] },
+    { "id": "medicine", "name": "实心球", "r": 0.13, "mass": 4.0, "shell": false, "solref": [0.02, 1] },
+    { "id": "shot", "name": "铅球", "r": 0.06, "mass": 7.26, "shell": false, "solref": [0.02, 1] }
+  ]
+}
