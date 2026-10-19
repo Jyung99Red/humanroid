@@ -48,6 +48,8 @@ REWARD = dict(
     waist_twist=0.0,   # 惩罚腰左右扭(abdomen_z)和侧弯(abdomen_x), 即骨盆相对胸口的扭转和侧倾。不罚前后弯。例如 2.0
     pelvis_level=0.0,  # 惩罚骨盆相对地面左右侧倾(走路像模特扭胯); 真人约 ±4~5°。例如 10.0
     step_width=0.0,    # 两脚左右间距(朝向坐标系)小于 STEP_WIDTH_MIN 时罚, 贴着中线或交叉时罚满 1。例如 1.0
+    step_wide=0.0,     # 两脚左右间距超过 STEP_WIDTH_MAX 时罚(超出部分 / 0.1 m 的平方); 侧移指令 > 0.1 或躲球规划接管时不罚。
+                       # dodge2 练躲球后叉着腿走(落地时两脚间距 25 cm, 真人约 10~15)。例如 2.0
     heel_down=0.0,     # 每次着地的前 70%(按步态时钟)脚跟要踩实: 罚脚尖朝下(踮脚); 最后 30% 留给蹬地, 落地时脚尖朝上不罚。例如 2.0
     toe_off=0.0,       # 每次着地的最后 30% 脚还踩着地时脚跟抬起、脚尖压地(蹬地)给奖励, 压到 20° 封顶(每只脚最多 1)。例如 0.5
     swing_flat=0.0,    # 摆动中段(进度 25%~75%)脚要放平: 罚脚相对地面前后倾斜(朝上朝下都罚)。例如 2.0
@@ -81,6 +83,7 @@ REWARD = dict(
     getup_stand=2.0,   # 站起来了(高度 > 90%、立直、只有脚着地)以后: 一半看不动(水平速度小), 一半看姿态接近默认站姿(交给走路策略时好接)
 )
 STEP_WIDTH_MIN = 0.08     # 米, 真人走路两脚间距约 8~12 cm
+STEP_WIDTH_MAX = 0.20     # 米, step_wide 的上限(sp4 落地时约 13.6 cm)
 FOOT_CLEAR_H = 0.05       # 米, 摆动中途脚底抬起的高度(脚刚体原点平放时离地 0.027)。真人摆到中途脚底只离地几厘米; 定成 10 cm 会逼出踮脚走
 LAND_TOE_UP = 20.0        # 度, 脚跟着地时脚尖最多翘多少(真人约 15~25°)
 KNEE_SWING_DEG = 40.0     # 度, 摆腿中途膝盖弯多少(真人走路约 60°, 慢走、侧移小一些)
@@ -776,8 +779,8 @@ class HumanoidEnv:
         want = (torch.stack([self.phase, self.phase - 0.5], dim=1) % 1.0 < self.gait[:, 1:2]).float()
         # 被推之后 PUSH_GRACE 秒内不管节奏: 要乱跨几步才稳得住(站着被推也一样); 换指令后 cmd_grace 秒内也不管(哪只脚先迈都行)
         grace = ((self.since_push.float() * self.dt < PUSH_GRACE) | (self.since_cmd.float() * self.dt < self.cmd_grace)).float()
-        if self.balls:                                     # 来球时也不管节奏(躲的那一步哪只脚都行)
-            grace = torch.maximum(grace, self._ball_grace())
+        if self.balls:                                     # 躲球时不管节奏(躲的那一步哪只脚都行)。有规划时只在规划接管时放: 整个来球期间都放(dodge2), 碎步、不跟步频
+            grace = torch.maximum(grace, self.dodge_on.float() if self.balls["steer"] else self._ball_grace())
         r = r + rw["clock"] * (1 - grace) * (self.contact == want).float().mean(dim=1)
         if rw["stand_feet"]:
             standing = (self.gait[:, 1] > 0.99).float() * (1 - grace)
@@ -810,6 +813,11 @@ class HumanoidEnv:
             d = self.xpos[:, self.foot_ids[1], :2] - self.xpos[:, self.foot_ids[0], :2]
             lat = -s * d[:, 0] + c * d[:, 1]
             r = r - rw["step_width"] * ((STEP_WIDTH_MIN - lat).clamp(min=0) / STEP_WIDTH_MIN).clamp(max=1) ** 2
+        if rw["step_wide"]:
+            d = self.xpos[:, self.foot_ids[1], :2] - self.xpos[:, self.foot_ids[0], :2]
+            lat = (-s * d[:, 0] + c * d[:, 1]).abs()
+            free = (self.cmd[:, 1].abs() > 0.1) | (self.dodge_on if self.balls and self.balls["steer"] else torch.zeros_like(lat, dtype=torch.bool))
+            r = r - rw["step_wide"] * ((lat - STEP_WIDTH_MAX).clamp(min=0) / 0.1) ** 2 * (~free).float()
         if rw["heel_down"] or rw["toe_off"] or rw["swing_flat"] or rw["foot_flat"] or rw["heel_strike"]:
             # 按步态时钟分段(s = 着地进度 0 -> 1)。往前走: 着地前 70% 脚跟踩实, 最后 30% 蹬地, 前 15~20% 脚跟着地、脚尖可以翘。
             # 倒退是往前走倒着放: 前 30% 前脚掌先着地(脚尖朝下不罚), 最后 15~20% 脚跟最后离地(脚尖可以翘)。

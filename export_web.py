@@ -43,7 +43,7 @@ if __name__ == "__main__":
     ws = torch.load(a.walk, map_location="cuda:0", weights_only=False)
     gs = torch.load(a.getup, map_location="cuda:0", weights_only=False)
     cfg = combo_config(ws, gs)
-    env = HumanoidEnv(1, **cfg)                              # 只用来取动作换算的常数(和训练完全一样的算法)
+    env = HumanoidEnv(1, **dict(cfg, balls=None))             # 只用来取动作换算的常数(和训练完全一样的算法); 起身模式不扔球
     m = env.mjm
     os.makedirs(a.out, exist_ok=True)
     xml_name = os.path.basename(cfg["xml"])
